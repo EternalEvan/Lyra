@@ -25,9 +25,8 @@
 
 **[Yixuan Zhu](https://eternalevan.github.io/), [Wenjun Que](https://github.com/wjque), [Minglei Shi](https://shiml20.github.io), [Yanran Zhang](https://github.com/Zhangyr2022), [Chan Yan Ki](https://github.com/yankeee-0411), [Wenzhao Zheng<sup>†</sup>](https://wzzheng.net), [Jie Zhou](https://person.zju.edu.cn/en/lzz), [Jiwen Lu](https://person.zju.edu.cn/en/huhaoji)**
 <!-- <br> -->
-(† Project leader)
+Tsinghua University († Project leader)
 
-Tsinghua University
 </div>
 
 ## 🔥 Updates
