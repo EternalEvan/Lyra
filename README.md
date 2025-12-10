@@ -2,15 +2,11 @@
 Official repository of Lyra: 3D-Aware Reinforcement Fine-Tuning for Interactive World Models
 
 
-<div align="center">
-<div align="center" style="margin-top: 0px; margin-bottom: -30px;">
-<img src="./assets/images/lyra-logo-text.png" width="60%"/>
-</div>
 
 <div align="center">
 
   <div style="margin-top: 0; margin-bottom: -20px;">
-    <img src="./assets/images/logo-text-2.png" width="50%" />
+    <img src="./assets/images/lyra-logo-text.png" width="50%" />
   </div>
 
   <h3 style="margin-top: 0;">
