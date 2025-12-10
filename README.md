@@ -7,7 +7,27 @@ Official repository of Lyra: 3D-Aware Reinforcement Fine-Tuning for Interactive 
 <img src="./assets/images/lyra-logo-text.png" width="60%"/>
 </div>
 
-### [<a href="https://arxiv.org/abs/2503.11647" target="_blank">arXiv</a>] [<a href="https://eternalevan.github.io/Lyra-project/" target="_blank">Project Page</a>]
+<div align="center">
+
+  <div style="margin-top: 0; margin-bottom: -20px;">
+    <img src="./assets/images/logo-text-2.png" width="50%" />
+  </div>
+
+  <h3 style="margin-top: 0;">
+    📄
+    [<a href="https://arxiv.org/pdf/2512.08931" target="_blank">arXiv</a>]
+    &nbsp;&nbsp;
+    🏠
+    [<a href="https://eternalevan.github.io/Lyra-project/" target="_blank">Project Page</a>]
+    &nbsp;&nbsp;
+    🤗
+    [<a href="https://huggingface.co/EvanEternal/Lyra" target="_blank">Huggingface</a>]
+  </h3>
+
+</div>
+
+<div align="center">
+
 **[Yixuan Zhu](https://eternalevan.github.io/), [Wenjun Que](https://github.com/wjque), [Minglei Shi](https://shiml20.github.io), [Yanran Zhang](https://github.com/Zhangyr2022), [Chan Yan Ki](https://github.com/yankeee-0411), [Wenzhao Zheng<sup>†</sup>](https://wzzheng.net), [Jie Zhou](https://person.zju.edu.cn/en/lzz), [Jiwen Lu](https://person.zju.edu.cn/en/huhaoji)**
 <!-- <br> -->
 († Project leader)
