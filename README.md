@@ -1,5 +1,4 @@
-# Lyra
-Official repository of Lyra: 3D-Aware Reinforcement Fine-Tuning for Interactive World Models
+# Lyra <img src="./assets/images/logo.png" alt="logo" style="height: 1em; vertical-align: baseline; margin: 0 0.1em;">: 3D-Aware Reinforcement Fine-Tuning for Interactive World Models
 
 
 
