@@ -220,10 +220,9 @@ class ModalityProcessor(nn.Module):
         output = output.to(original_dtype)
         
         return output
-
-
-class MultiModalMoE(nn.Module):
-    """简化的多模态MoE - 只保留专家，不包含router"""
+    
+class SekaiModal(nn.Module):
+    '''process sekai cam_emb'''
     
     def __init__(self, unified_dim: int = 30, hidden_dim: int = 60, output_dim: int = None, 
                  num_experts: int = 4, top_k: int = 2):
@@ -233,15 +232,6 @@ class MultiModalMoE(nn.Module):
         self.top_k = top_k
         self.output_dim = output_dim or unified_dim
         
-        # 🔧 定义模态到专家的映射
-        self.modality_to_expert = {
-            "sekai": 0,      # sekai数据使用专家0
-            "nuscenes": 1,   # nuscenes数据使用专家1
-            "openx": 2,      # openx数据使用专家2
-            "unknown": 0     # 默认使用专家0
-        }
-        
-        # 🔧 移除router，只保留专家网络
         # Experts - 输入unified_dim，输出output_dim (每层独立)
         self.experts = nn.ModuleList([
             nn.Sequential(
@@ -249,17 +239,18 @@ class MultiModalMoE(nn.Module):
             ) for _ in range(num_experts)
         ])
         
-    def forward(self, x: torch.Tensor, expert_weights: torch.Tensor, top_k_indices: torch.Tensor, 
-                modality_type: str = "unknown") -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, 
+                x: torch.Tensor, 
+                expert_weights: torch.Tensor, 
+                top_k_indices: torch.Tensor, 
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             x: [batch_size, seq_len, unified_dim]
             expert_weights: [batch_size, seq_len, top_k] - 从全局router得到的权重
             top_k_indices: [batch_size, seq_len, top_k] - 从全局router得到的专家索引
-            modality_type: 模态类型标识（用于专家分配和统计）
         Returns:
             output: [batch_size, seq_len, output_dim]
-            expert_stats: 专家选择统计信息
         """
         batch_size, seq_len, input_dim = x.shape
         assert input_dim == self.unified_dim, f"Expected input dim {self.unified_dim}, got {input_dim}"
@@ -267,12 +258,6 @@ class MultiModalMoE(nn.Module):
         # 🔧 修正：确保数据类型匹配
         original_dtype = x.dtype
         x = x.to(self.experts[0][0].weight.dtype)
-        
-        # 🔧 获取该模态应该使用的目标专家
-        target_expert_id = self.modality_to_expert.get(modality_type, 0)
-        
-        # 🔧 收集专家选择统计信息
-        expert_stats = self.collect_expert_statistics(expert_weights, top_k_indices, modality_type, target_expert_id)
         
         # Expert processing (使用当前层的独立experts)
         expert_outputs = []
@@ -285,7 +270,7 @@ class MultiModalMoE(nn.Module):
         # Weighted combination using provided weights and indices
         output = torch.zeros(batch_size, seq_len, self.output_dim, 
                            device=x.device, dtype=x.dtype)
-        
+
         for k in range(self.top_k):
             expert_idx = top_k_indices[:, :, k]  # [batch, seq]
             weight = expert_weights[:, :, k:k+1]  # [batch, seq, 1]
@@ -301,56 +286,20 @@ class MultiModalMoE(nn.Module):
         # 🔧 恢复原始数据类型
         output = output.to(original_dtype)
         
-        return output, expert_stats
-    
-    def collect_expert_statistics(self, expert_weights, top_k_indices, modality_type, target_expert_id):
-        """🔧 收集专家选择统计信息"""
-        with torch.no_grad():
-            # 计算每个专家被选中的频率
-            expert_selection_count = torch.zeros(self.num_experts, device=expert_weights.device)
-            for expert_id in range(self.num_experts):
-                expert_selection_count[expert_id] = (top_k_indices == expert_id).float().sum()
-            
-            total_selections = expert_selection_count.sum()
-            expert_selection_ratio = expert_selection_count / (total_selections + 1e-8)
-            
-            # 计算平均权重
-            avg_expert_weights = torch.zeros(self.num_experts, device=expert_weights.device)
-            for expert_id in range(self.num_experts):
-                mask = (top_k_indices == expert_id)
-                if mask.sum() > 0:
-                    avg_expert_weights[expert_id] = expert_weights[mask].mean()
-            
-            # 计算Top-K权重统计
-            avg_top_k_weights = expert_weights.mean(dim=(0, 1))
-            
-            # 🔧 计算目标专家的使用率
-            target_expert_usage = expert_selection_ratio[target_expert_id].item()
-            
-            # 返回统计信息字典
-            return {
-                'modality_type': modality_type,
-                'target_expert_id': target_expert_id,
-                'target_expert_usage': target_expert_usage,
-                'expert_selection_ratio': expert_selection_ratio.float().cpu().numpy(),
-                'avg_expert_weights': avg_expert_weights.float().cpu().numpy(),
-                'avg_top_k_weights': avg_top_k_weights.float().cpu().numpy(),
-                'num_experts': self.num_experts,
-                'top_k': self.top_k
-            }
+        return output
+
                                     
-class DiTBlockWithMoE(nn.Module):
-    """集成MoE的DiT Block"""
+class DiTBlockWithCam(nn.Module):
+    """DiT Block with camera embeddings"""
     
     def __init__(self, has_image_input: bool, dim: int, num_heads: int, ffn_dim: int, 
-                 eps: float = 1e-6, use_moe: bool = True, moe_config: Optional[dict] = None):
+                 eps: float = 1e-6):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.ffn_dim = ffn_dim
-        self.use_moe = use_moe
         
-        # 原有的DiT组件
+        # Original DiT components
         self.self_attn = SelfAttention(dim, num_heads, eps)
         self.cross_attn = CrossAttention(dim, num_heads, eps, has_image_input=has_image_input)
         self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
@@ -362,59 +311,36 @@ class DiTBlockWithMoE(nn.Module):
             nn.Linear(ffn_dim, dim)
         )
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
+        
+        # self.moe = SekaiModal(
+        #     unified_dim=25,
+        #     output_dim=dim,
+        #     num_experts=4,
+        #     top_k=2
+        # )
 
-        # 🔧 只在启用MoE时初始化MoE组件（无router版本）
-        if self.use_moe and moe_config:
-            unified_dim = moe_config.get("unified_dim", 30)  
-            # MoE模块 - 输入unified_dim，输出dim用于残差连接，无router
-            self.moe = MultiModalMoE(
-                unified_dim=unified_dim,
-                output_dim=dim,  # 输出维度与transformer block的dim匹配
-                num_experts=moe_config.get("num_experts", 4),
-                top_k=moe_config.get("top_k", 2)
-            )
-
-    def forward(self, x, context, cam_emb, t_mod, freqs, 
-                modality_inputs: Optional[dict] = None,
-                router_weights: Optional[torch.Tensor] = None,
-                router_indices: Optional[torch.Tensor] = None):
-        # 原有的modulation
+    def forward(self, x, context, cam_emb, t_mod, freqs,
+                expert_weights: Optional[torch.Tensor] = None,
+                expert_indices: Optional[torch.Tensor] = None):
+        # Original modulation
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
 
-        # 🔧 MoE处理 - 使用全局router的结果
-        if self.use_moe and modality_inputs and hasattr(self, 'moe') and router_weights is not None:
-            # 合并所有模态的输入（已经通过全局processor处理过）
-            combined_modality_input = None
-            active_modality = "unknown"
-            for modality_type, processed_input in modality_inputs.items():
-                active_modality = modality_type  # 记录当前活跃的模态
-                if combined_modality_input is None:
-                    combined_modality_input = processed_input
-                else:
-                    combined_modality_input = combined_modality_input + processed_input
-            
-            if combined_modality_input is not None:
-                # 🔧 使用全局router的权重和索引
-                moe_output, expert_stats = self.moe(
-                    combined_modality_input, 
-                    router_weights, 
-                    router_indices, 
-                    active_modality
-                )
-                input_x = input_x + moe_output
-                
-                # 🔧 存储专家统计信息供后续收集
-                if not hasattr(self, 'expert_stats_buffer'):
-                    self.expert_stats_buffer = []
-                    
-                self.expert_stats_buffer.append(expert_stats)
+        # Camera embedding branch
+        if cam_emb is not None:
+            sekai_output = self.moe(
+                cam_emb,
+                expert_weights,
+                expert_indices
+            )
+            input_x = input_x + sekai_output
         elif cam_emb is not None and hasattr(self, 'cam_encoder'):
-            # 传统camera编码器作为fallback
             cam_emb = cam_emb.to(self.cam_encoder.weight.dtype)
             cam_emb = self.cam_encoder(cam_emb)
             input_x = input_x + cam_emb
+        else:
+            raise NotImplementedError("")
 
         input_x = input_x.to(self.projector.weight.dtype)
 
@@ -459,7 +385,7 @@ class Head(nn.Module):
         return x
 
 
-class WanModelMoe(torch.nn.Module):
+class WanModelCam(torch.nn.Module):
     def __init__(
         self,
         dim: int,
@@ -473,17 +399,12 @@ class WanModelMoe(torch.nn.Module):
         num_heads: int,
         num_layers: int,
         has_image_input: bool,
-        # 🔧 新增MoE参数
-        use_moe: bool = True,
-        moe_config: Optional[dict] = None
     ):
         super().__init__()
         self.dim = dim
         self.freq_dim = freq_dim
         self.has_image_input = has_image_input
         self.patch_size = patch_size
-        self.use_moe = use_moe  # 🔧 保存MoE配置
-        self.moe_config = moe_config or {}
 
         self.patch_embedding = nn.Conv3d(
             in_dim, dim, kernel_size=patch_size, stride=patch_size)
@@ -500,30 +421,9 @@ class WanModelMoe(torch.nn.Module):
         self.time_projection = nn.Sequential(
             nn.SiLU(), nn.Linear(dim, dim * 6))
 
-        # # 🔧 新增：创建全局router - 放在WanModel级别
-        # if use_moe and moe_config:
-        #     unified_dim = moe_config.get("unified_dim", 30)
-        #     num_experts = moe_config.get("num_experts", 4)
-        #     self.top_k = moe_config.get("top_k", 2)
-            
-            # 🔧 定义模态到专家的映射
-        self.modality_to_expert = {
-            "sekai": 0,      # sekai数据使用专家0
-            "nuscenes": 1,   # nuscenes数据使用专家1
-            "openx": 2,      # openx数据使用专家2
-            "unknown": 0     # 默认使用专家0
-        }
-        self.top_k = 1
-            
-        #     self.global_router = nn.Linear(unified_dim, num_experts)
-        #     print(f"✅ 创建了全局router: input_dim={unified_dim}, num_experts={num_experts}")
-        # else:
-        #     self.global_router = None
-        #     self.modality_to_expert = {}
-
-        # 🔧 根据是否使用MoE创建不同的blocks
+        # Blocks with camera embedding only
         self.blocks = nn.ModuleList([
-            DiTBlockWithMoE(has_image_input, dim, num_heads, ffn_dim, eps, use_moe, moe_config)
+            DiTBlockWithCam(has_image_input, dim, num_heads, ffn_dim, eps)
             for _ in range(num_layers)
         ])
         
@@ -533,27 +433,6 @@ class WanModelMoe(torch.nn.Module):
 
         if has_image_input:
             self.img_emb = MLP(1280, dim)  # clip_feature_dim = 1280
-
-    def compute_router_decisions(self, combined_modality_input: torch.Tensor, modality_type: str):
-        """
-        不用router，直接根据modality_to_expert写死专家选择和权重
-        """
-        batch_size, seq_len, _ = combined_modality_input.shape
-        num_experts = len(self.modality_to_expert)
-        top_k = self.top_k if hasattr(self, "top_k") else 1
-
-        # 获取目标专家id
-        target_expert_id = self.modality_to_expert.get(modality_type, 0)
-
-        # router_indices: 全部填目标专家
-        router_indices = torch.full((batch_size, seq_len, top_k), target_expert_id, dtype=torch.long, device=combined_modality_input.device)
-        # router_weights: 全部为1
-        router_weights = torch.ones((batch_size, seq_len, top_k), dtype=combined_modality_input.dtype, device=combined_modality_input.device)
-
-        # 专业化损失直接为0
-        specialization_loss = torch.tensor(0.0, device=combined_modality_input.device)
-
-        return router_weights, router_indices, specialization_loss
 
     def patchify(self, x: torch.Tensor):
         x = self.patch_embedding(x)
@@ -569,11 +448,11 @@ class WanModelMoe(torch.nn.Module):
         )
 
     def create_clean_x_embedder(self):
-        """创建类似FramePack的clean_x_embedder"""        
+        """Create a clean_x_embedder similar to FramePack"""        
         class CleanXEmbedder(nn.Module):
             def __init__(self, inner_dim):
                 super().__init__()
-                # 参考hunyuan_video_packed.py的设计
+                # Based on hunyuan_video_packed.py design
                 self.proj = nn.Conv3d(16, inner_dim, kernel_size=(1, 2, 2), stride=(1, 2, 2))
                 self.proj_2x = nn.Conv3d(16, inner_dim, kernel_size=(2, 4, 4), stride=(2, 4, 4))
                 self.proj_4x = nn.Conv3d(16, inner_dim, kernel_size=(4, 8, 8), stride=(4, 8, 8))
@@ -591,33 +470,33 @@ class WanModelMoe(torch.nn.Module):
         return CleanXEmbedder(self.dim)
 
     def rope(self, frame_indices, height, width, device):
-        """🔧 模仿HunyuanVideo的rope方法"""
+        """Replica of HunyuanVideo's rope method"""
         batch_size = frame_indices.shape[0]
         seq_len = frame_indices.shape[1]
         
-        # 使用frame_indices生成时间维度的频率
+        # Generate temporal freqs using frame_indices
         f_freqs = self.freqs[0][frame_indices.to("cpu")]  # [batch, seq_len, freq_dim]
         
-        # 为每个spatial位置生成频率
+        # Generate frequencies for each spatial position
         h_positions = torch.arange(height, device=device).unsqueeze(0).unsqueeze(0).expand(batch_size, seq_len, -1)
         w_positions = torch.arange(width, device=device).unsqueeze(0).unsqueeze(0).expand(batch_size, seq_len, -1)
         
-        # 获取h和w的频率
+        # Get h and w freqs
         h_freqs = self.freqs[1][h_positions.to("cpu")]  # [batch, seq_len, height, h_freq_dim]
         w_freqs = self.freqs[2][w_positions.to("cpu")]  # [batch, seq_len, width, w_freq_dim]
         
-        # 扩展到完整的spatial grid
+        # Expand to full spatial grid
         f_freqs_expanded = f_freqs.unsqueeze(2).unsqueeze(3).expand(-1, -1, height, width, -1)
         h_freqs_expanded = h_freqs.unsqueeze(3).expand(-1, -1, -1, width, -1)
         w_freqs_expanded = w_freqs.unsqueeze(2).expand(-1, -1, height, -1, -1)
         
-        # 合并所有频率
+        # Concatenate all freqs
         rope_freqs = torch.cat([f_freqs_expanded, h_freqs_expanded, w_freqs_expanded], dim=-1)
         
         return rope_freqs  # [batch, seq_len, height, width, total_freq_dim]
 
     def pad_for_3d_conv(self, x, kernel_size):
-        """3D卷积的padding - 参考hunyuan实现"""
+        """Padding for 3D convolution - based on hunyuan implementation"""
         if len(x.shape) == 5:  # [B, C, T, H, W]
             b, c, t, h, w = x.shape
             pt, ph, pw = kernel_size
@@ -625,7 +504,7 @@ class WanModelMoe(torch.nn.Module):
             pad_h = (ph - (h % ph)) % ph
             pad_w = (pw - (w % pw)) % pw
             return torch.nn.functional.pad(x, (0, pad_w, 0, pad_h, 0, pad_t), mode='replicate')
-        elif len(x.shape) == 6:  # [B, T, H, W, C] (RoPE频率)
+        elif len(x.shape) == 6:  # [B, T, H, W, C] (RoPE freqs)
             b, t, h, w, c = x.shape
             pt, ph, pw = kernel_size
             pad_t = (pt - (t % pt)) % pt
@@ -636,8 +515,8 @@ class WanModelMoe(torch.nn.Module):
             raise ValueError(f"Unsupported tensor shape: {x.shape}")
 
     def center_down_sample_3d(self, x, scale_factor):
-        """🔧 模仿HunyuanVideo的center_down_sample_3d"""
-        if len(x.shape) == 6:  # [B, T, H, W, C] (RoPE频率)
+        """Replica of HunyuanVideo's center_down_sample_3d"""
+        if len(x.shape) == 6:  # [B, T, H, W, C] (RoPE freqs)
             st, sh, sw = scale_factor
             return x[:, ::st, ::sh, ::sw, :]
         elif len(x.shape) == 5:  # [B, C, T, H, W]
@@ -646,48 +525,24 @@ class WanModelMoe(torch.nn.Module):
         else:
             raise ValueError(f"Unsupported tensor shape: {x.shape}")
 
-    def process_modality_inputs(self, modality_inputs):
-        """🔧 全局处理模态输入，返回统一格式的embeddings"""
-        if not modality_inputs or not self.use_moe:
-            return None
-        
-        processed_modality_inputs = {}
-        
-        for modality_type, input_data in modality_inputs.items():
-            if modality_type == "sekai" and hasattr(self, 'sekai_processor'):
-                processed = self.sekai_processor(input_data)
-                processed_modality_inputs[modality_type] = processed
-            elif modality_type == "nuscenes" and hasattr(self, 'nuscenes_processor'):
-                processed = self.nuscenes_processor(input_data)
-                processed_modality_inputs[modality_type] = processed
-            elif modality_type == "openx" and hasattr(self, 'openx_processor'):
-                processed = self.openx_processor(input_data)
-                processed_modality_inputs[modality_type] = processed
-            else:
-                print(f"⚠️ 未知的模态类型: {modality_type}")
-                continue
-        
-        return processed_modality_inputs, processed
-    
     def process_input_hidden_states(self, 
                                 latents, latent_indices=None,
                                 clean_latents=None, clean_latent_indices=None,
                                 clean_latents_2x=None, clean_latent_2x_indices=None,
                                 clean_latents_4x=None, clean_latent_4x_indices=None,
-                                cam_emb=None,
-                                modality_inputs: Optional[dict] = None):  # 🔧 新增modality_inputs参数
-        """🔧 处理FramePack风格的多尺度输入 + MoE模态输入处理 - 完全照wan_video_dit_recam_future实现"""
-        
-        # 主要latents处理
+                                cam_emb=None):
+        """Process FramePack-style multi-scale inputs (camera embedding)."""
+
+        # Main latents processing
         hidden_states, grid_size = self.patchify(latents)
         B, T_patches, C = hidden_states.shape
         f, h, w = grid_size
         
-        # 🔧 修正：使用latent_indices指定的时间位置计算RoPE频率
+        # Fix: use latent_indices to compute temporal RoPE freqs
         if latent_indices is None:
             latent_indices = torch.arange(0, f, device=hidden_states.device).unsqueeze(0).expand(B, -1)
         
-        # 为主要latents计算RoPE频率
+        # Compute RoPE freqs for main latents
         main_rope_freqs_list = []
         for b in range(B):
             batch_rope_freqs = []
@@ -709,29 +564,29 @@ class WanModelMoe(torch.nn.Module):
         
         rope_freqs = torch.stack(main_rope_freqs_list, dim=0)  # [B, f*h*w, total_freq_dim]
         
-        # 🔧 准备主要scale (1x) 的modality embeddings - 空间维度为 h*w
+        # Prepare modality embeddings for main scale (1x) - spatial dim h*w
         start_indice = clean_latent_indices[0][0].item() if clean_latent_indices is not None else 0
         combined_modality_embeddings = None
         
-        # 🔧 兼容原有的cam_emb处理（完全照抄wan_video_dit_recam_future的逻辑）
+        # Compatibility with existing cam_emb handling (copied from wan_video_dit_recam_future)
         if cam_emb is not None:
-            # 提取target部分的camera（基于latent_indices）
+            # Extract target portion of camera (based on latent_indices)
             target_start = latent_indices[0].min().item() - start_indice
             target_end = latent_indices[0].max().item() + 1 - start_indice
             target_camera = cam_emb[:, target_start:target_end, :]  # [B, target_frames, cam_dim]
             
-            # 🔧 为主要latents处理camera空间扩展
+            # Expand camera to match spatial dimensions for main latents
             target_camera_spatial = target_camera.unsqueeze(2).unsqueeze(3).repeat(1, 1, h, w, 1)
             target_camera_spatial = rearrange(target_camera_spatial, 'b f h w d -> b (f h w) d')
             combined_modality_embeddings = target_camera_spatial
         
-        # 🔧 处理clean_latents (1x scale) - 完全参考wan_video_dit_recam_future
+        # Process clean_latents (1x scale) - based on wan_video_dit_recam_future
         if clean_latents is not None and clean_latent_indices is not None:
             clean_latents = clean_latents.to(hidden_states)
             clean_hidden_states = self.clean_x_embedder(clean_latents, scale="1x")
             clean_hidden_states = rearrange(clean_hidden_states, 'b c f h w -> b (f h w) c')
             
-            # 🔧 为clean_latents计算RoPE频率
+            # Compute RoPE freqs for clean_latents
             clean_rope_freqs_list = []
             for b in range(B):
                 clean_batch_rope_freqs = []
@@ -753,7 +608,7 @@ class WanModelMoe(torch.nn.Module):
             
             clean_rope_freqs = torch.stack(clean_rope_freqs_list, dim=0)
             
-            # 🔧 处理clean modality embeddings - 1x空间维度
+            # Prepare clean modality embeddings - 1x spatial dim
             if cam_emb is not None:
                 clean_start = clean_latent_indices[0].min().item() - start_indice
                 clean_end = clean_latent_indices[0].max().item() + 1 - start_indice
@@ -763,18 +618,18 @@ class WanModelMoe(torch.nn.Module):
                 else:
                     clean_camera = cam_emb[:, [clean_start, clean_end], :]   # [B, 2, cam_dim]  
                                 
-                # 扩展到1x空间维度 h*w
+                # Expand to 1x spatial dim h*w
                 clean_camera_spatial = clean_camera.unsqueeze(2).unsqueeze(3).repeat(1, 1, h, w, 1)
                 clean_camera_spatial = rearrange(clean_camera_spatial, 'b f h w d -> b (f h w) d')
                 combined_modality_embeddings = torch.cat([clean_camera_spatial, combined_modality_embeddings], dim=1)
             
-            # cat clean latents和frequencies到前面
+            # Concatenate clean latents and frequencies to the front
             hidden_states = torch.cat([clean_hidden_states, hidden_states], dim=1)
             rope_freqs = torch.cat([clean_rope_freqs, rope_freqs], dim=1)
         
-        # 🔧 处理clean_latents_2x (2x scale) - 完全参考wan_video_dit_recam_future
+        # Process clean_latents_2x (2x scale) - based on wan_video_dit_recam_future
         if clean_latents_2x is not None and clean_latent_2x_indices is not None and clean_latent_2x_indices.numel() > 0:
-            # 过滤有效索引（非-1）
+            # Filter valid indices (non -1)
             valid_2x_indices = clean_latent_2x_indices[clean_latent_2x_indices >= 0]
             
             if len(valid_2x_indices) > 0:
@@ -785,18 +640,18 @@ class WanModelMoe(torch.nn.Module):
                 _, _, clean_2x_f, clean_2x_h, clean_2x_w = clean_hidden_states_2x.shape
                 clean_hidden_states_2x = rearrange(clean_hidden_states_2x, 'b c f h w -> b (f h w) c')
                 
-                # 🔧 为2x latents计算RoPE频率 - 基于实际的下采样结果
+                # Compute RoPE freqs for 2x latents based on actual downsampled results
                 clean_2x_rope_freqs_list = []
                 for b in range(B):
                     clean_2x_batch_rope_freqs = []
                     
-                    # 🔧 使用clean_2x_f作为实际的时间帧数
+                    # Use clean_2x_f as the actual number of time frames
                     for frame_idx in range(clean_2x_f):
-                        # 计算对应的原始时间索引
+                        # Compute corresponding original time index
                         if frame_idx < len(valid_2x_indices):
                             t_idx = valid_2x_indices[frame_idx]
                         else:
-                            # 如果超出有效索引，使用0频率
+                            # If beyond valid indices, use last valid index or 0
                             t_idx = valid_2x_indices[-1] if len(valid_2x_indices) > 0 else 0
                         
                         f_freq = self.freqs[0][t_idx:t_idx+1]
@@ -816,9 +671,9 @@ class WanModelMoe(torch.nn.Module):
                 
                 clean_2x_rope_freqs = torch.stack(clean_2x_rope_freqs_list, dim=0)
                 
-                # 🔧 处理2x modality embeddings
+                # Prepare 2x modality embeddings
                 if cam_emb is not None:
-                    # 创建2x camera，0填充无效部分
+                    # Create 2x camera, fill invalid parts with zeros
                     clean_2x_camera = torch.zeros(B, clean_2x_f, cam_emb.shape[-1], dtype=cam_emb.dtype, device=cam_emb.device)
                     
                     for frame_idx in range(min(clean_2x_f, len(valid_2x_indices))):
@@ -833,9 +688,9 @@ class WanModelMoe(torch.nn.Module):
                 hidden_states = torch.cat([clean_hidden_states_2x, hidden_states], dim=1)
                 rope_freqs = torch.cat([clean_2x_rope_freqs, rope_freqs], dim=1)
         
-        # 🔧 处理clean_latents_4x (4x scale) - 完全参考wan_video_dit_recam_future
+        # Process clean_latents_4x (4x scale) - based on wan_video_dit_recam_future
         if clean_latents_4x is not None and clean_latent_4x_indices is not None and clean_latent_4x_indices.numel() > 0:
-            # 过滤有效索引（非-1）
+            # Filter valid indices (non -1)
             valid_4x_indices = clean_latent_4x_indices[clean_latent_4x_indices >= 0]
             
             if len(valid_4x_indices) > 0:
@@ -846,18 +701,18 @@ class WanModelMoe(torch.nn.Module):
                 _, _, clean_4x_f, clean_4x_h, clean_4x_w = clean_hidden_states_4x.shape
                 clean_hidden_states_4x = rearrange(clean_hidden_states_4x, 'b c f h w -> b (f h w) c')
                 
-                # 🔧 为4x latents计算RoPE频率 - 基于实际的下采样结果
+                # Compute RoPE freqs for 4x latents based on actual downsampled results
                 clean_4x_rope_freqs_list = []
                 for b in range(B):
                     clean_4x_batch_rope_freqs = []
                     
-                    # 🔧 使用clean_4x_f作为实际的时间帧数
+                    # Use clean_4x_f as the actual number of time frames
                     for frame_idx in range(clean_4x_f):
-                        # 计算对应的原始时间索引
+                        # Compute corresponding original time index
                         if frame_idx < len(valid_4x_indices):
                             t_idx = valid_4x_indices[frame_idx]
                         else:
-                            # 如果超出有效索引，使用0频率
+                            # If beyond valid indices, use last valid index or 0
                             t_idx = valid_4x_indices[-1] if len(valid_4x_indices) > 0 else 0
                         
                         f_freq = self.freqs[0][t_idx:t_idx+1]
@@ -877,9 +732,9 @@ class WanModelMoe(torch.nn.Module):
                 
                 clean_4x_rope_freqs = torch.stack(clean_4x_rope_freqs_list, dim=0)
                 
-                # 🔧 处理4x modality embeddings
+                # Prepare 4x modality embeddings
                 if cam_emb is not None:
-                    # 创建4x camera，0填充无效部分
+                    # Create 4x camera, fill invalid parts with zeros
                     clean_4x_camera = torch.zeros(B, clean_4x_f, cam_emb.shape[-1], dtype=cam_emb.dtype, device=cam_emb.device)
                     
                     for frame_idx in range(min(clean_4x_f, len(valid_4x_indices))):
@@ -896,45 +751,37 @@ class WanModelMoe(torch.nn.Module):
         
         rope_freqs = rope_freqs.unsqueeze(2).to(device=hidden_states.device)
         
-        # 🔧 关键修正：在return前处理modality_inputs
-        processed_modality_inputs = None
-        if modality_inputs and self.use_moe:
-            # 确定模态类型并将处理好的combined_modality_embeddings赋值给对应的模态
-            processed_modality_inputs = {}
-            for modality_type in modality_inputs.keys():
-                # 将处理好的camera embeddings赋给对应的模态
-                processed_modality_inputs[modality_type] = combined_modality_embeddings
+        processed_sekai_input = {}
+        processed_sekai_input['sekai'] = combined_modality_embeddings
         
-        return hidden_states, rope_freqs, grid_size, combined_modality_embeddings, processed_modality_inputs
+        return hidden_states, rope_freqs, grid_size, combined_modality_embeddings, processed_sekai_input
 
     def forward(self, 
                 latents, timestep, cam_emb,
-                # 🔧 FramePack参数
+                # FramePack parameters
                 latent_indices=None,
                 clean_latents=None, clean_latent_indices=None,
                 clean_latents_2x=None, clean_latent_2x_indices=None,
                 clean_latents_4x=None, clean_latent_4x_indices=None,
-                # 🔧 MoE参数
-                modality_inputs: Optional[dict] = None,
                 **kwargs):
-        
-        modality_inputs, cam_emb = self.process_modality_inputs(modality_inputs)
-        
-        # 🔧 清空之前的专家统计信息
-        for block in self.blocks:
-            if hasattr(block, 'expert_stats_buffer'):
-                block.expert_stats_buffer = []
-        
-        # 🔧 使用新的处理方法来处理多尺度输入和RoPE频率 + MoE模态输入
-        hidden_states, rope_freqs, grid_size, processed_cam_emb, processed_modality_inputs = self.process_input_hidden_states(
+
+        processed_sekai_input = {}
+        if hasattr(self, 'sekai_processor'):
+            cam_emb = self.sekai_processor(cam_emb)
+            processed_sekai_input['sekai'] = cam_emb
+        else:
+            raise NotImplementedError("Sekai camera embedding processor not defined.")
+
+        # Process multi-scale inputs and RoPE freqs
+        hidden_states, rope_freqs, grid_size, processed_cam_emb, processed_sekai_input = self.process_input_hidden_states(
             latents, latent_indices,
             clean_latents, clean_latent_indices,
             clean_latents_2x, clean_latent_2x_indices,
             clean_latents_4x, clean_latent_4x_indices,
-            cam_emb, modality_inputs
+            cam_emb
         )
         
-        # 计算原始latent序列长度（用于最后提取）
+        # Compute original latent sequence length (for final selection)
         batch_size, num_channels, num_frames, height, width = latents.shape
         p, p_t = self.patch_size[2], self.patch_size[0]  # [t, h, w]
         post_patch_num_frames = num_frames // p_t
@@ -942,7 +789,7 @@ class WanModelMoe(torch.nn.Module):
         post_patch_width = width // p
         original_context_length = post_patch_num_frames * post_patch_height * post_patch_width
         
-        # 处理其他embeddings
+        # Process other embeddings
         context = kwargs.get("context", None)
         if context is not None:
             context = self.text_embedding(context)
@@ -960,134 +807,34 @@ class WanModelMoe(torch.nn.Module):
             t_proj = t_proj.to(t.dtype)
         t_mod = t_proj.unflatten(1, (6, self.dim))
 
-        # 确保rope_freqs与hidden_states的序列长度匹配
+        # Ensure rope_freqs sequence length matches hidden_states sequence length
         assert rope_freqs.shape[1] == hidden_states.shape[1], \
-            f"RoPE频率序列长度 {rope_freqs.shape[1]} 与 hidden_states序列长度 {hidden_states.shape[1]} 不匹配"
+            f"RoPE freqs sequence length {rope_freqs.shape[1]} does not match hidden_states sequence length {hidden_states.shape[1]}"
         
-        # 🔧 全局router决策计算（一次性为所有层计算）
-        router_weights, router_indices, total_specialization_loss = None, None, torch.tensor(0.0, device=hidden_states.device)
-        active_modality = "unknown"
+        batch_size, seq_len, _ = processed_cam_emb.shape
+        top_k = self.top_k if hasattr(self, 'top_k') else 1
         
-        if self.use_moe and processed_modality_inputs:
-            # 合并所有模态的输入
-            combined_modality_input = None
-            for modality_type, processed_input in processed_modality_inputs.items():
-                active_modality = modality_type
-                if combined_modality_input is None:
-                    combined_modality_input = processed_input
-                else:
-                    combined_modality_input = combined_modality_input + processed_input
-            
-            #router_input = torch.cat([hidden_states, combined_modality_input], dim=-1)
-            if combined_modality_input is not None:
-                router_weights, router_indices, total_specialization_loss = self.compute_router_decisions(
-                    combined_modality_input, active_modality
-                )
-        
-        # 🔧 Transformer blocks - 传递全局router的结果
+        expert_indices = torch.full((batch_size, seq_len, top_k), 0, dtype=torch.long, device=processed_cam_emb.device)
+        expert_weights = torch.ones((batch_size, seq_len, top_k), dtype=processed_cam_emb.dtype, device=processed_cam_emb.device)
+
+        # Transformer blocks
         for block in self.blocks:
             hidden_states = block(
                 hidden_states, 
                 context, 
                 processed_cam_emb, 
                 t_mod, 
-                rope_freqs, 
-                processed_modality_inputs,
-                router_weights,  # 🔧 传递全局router权重
-                router_indices   # 🔧 传递全局router索引
+                rope_freqs,
+                expert_weights,
+                expert_indices
             )
         
-        # 🔧 收集并打印整体专家统计信息
-        #self.print_overall_expert_statistics()
-        
-        # 🔧 只对原始预测目标部分进行输出投影
+        # Project output only for the original prediction target portion
         hidden_states = hidden_states[:, -original_context_length:, :]
         hidden_states = self.head(hidden_states, t)
         hidden_states = self.unpatchify(hidden_states, grid_size)
         
-        return hidden_states, total_specialization_loss
-
-    def print_overall_expert_statistics(self):
-        """🔧 新增：打印整体专家统计信息 - 更新版本，显示全局router信息"""
-        all_expert_stats = []
-        
-        # 收集所有block的专家统计信息
-        for i, block in enumerate(self.blocks):
-            if hasattr(block, 'expert_stats_buffer') and len(block.expert_stats_buffer) > 0:
-                all_expert_stats.extend(block.expert_stats_buffer)
-        
-        if not all_expert_stats:
-            return
-        
-        # 按模态类型分组统计
-        modality_stats = {}
-        for stats in all_expert_stats:
-            modality = stats['modality_type']
-            if modality not in modality_stats:
-                modality_stats[modality] = {
-                    'selection_ratios': [],
-                    'expert_weights': [],
-                    'top_k_weights': [],
-                    'target_expert_usages': [],
-                    'target_expert_id': stats['target_expert_id'],
-                    'count': 0
-                }
-            
-            modality_stats[modality]['selection_ratios'].append(stats['expert_selection_ratio'])
-            modality_stats[modality]['expert_weights'].append(stats['avg_expert_weights'])
-            modality_stats[modality]['top_k_weights'].append(stats['avg_top_k_weights'])
-            modality_stats[modality]['target_expert_usages'].append(stats['target_expert_usage'])
-            modality_stats[modality]['count'] += 1
-        
-        # 打印整体统计信息
-        print("\n" + "="*60)
-        print("📊 【样本整体专家专业化统计】(全局Router + 分层Experts)")
-        print("="*60)
-        
-        for modality, stats in modality_stats.items():
-            if stats['count'] == 0:
-                continue
-                
-            # 计算该模态的平均统计
-            avg_selection_ratio = np.mean(stats['selection_ratios'], axis=0)
-            avg_expert_weights = np.mean(stats['expert_weights'], axis=0)
-            avg_top_k_weights = np.mean(stats['top_k_weights'], axis=0)
-            avg_target_expert_usage = np.mean(stats['target_expert_usages'])
-            target_expert_id = stats['target_expert_id']
-            
-            print(f"\n {modality.upper()} modality (Source {stats['count']} MoE blocks)")
-            print(f"   expected expert: Expert-{target_expert_id}")
-            print(f"   expected expert usage: {avg_target_expert_usage:.3f} ({avg_target_expert_usage*100:.1f}%)")
-            
-            print(f"   Expert chosen weight (global Router decision):")
-            for i, ratio in enumerate(avg_selection_ratio):
-                status = "🔥" if i == target_expert_id else "  "
-                print(f"    {status} Expert-{i}: {ratio:.3f} ({ratio*100:.1f}%)")
-            
-            print(f"    Expert avg weight:")
-            for i, weight in enumerate(avg_expert_weights):
-                status = "🔥" if i == target_expert_id else "  "
-                print(f"    {status} Expert-{i}: {weight:.3f}")
-            
-            # 专业化程度评估
-            if avg_target_expert_usage > 0.8:
-                specialization_status = " 高度专业化"
-            elif avg_target_expert_usage > 0.5:
-                specialization_status = " 良好专业化"
-            else:
-                specialization_status = "  专业化不足"
-            
-            print(f"   专业化程度: {specialization_status}")
-            
-            # 找出最常用的专家
-            most_used_expert = np.argmax(avg_selection_ratio)
-            most_used_ratio = avg_selection_ratio[most_used_expert]
-            if most_used_expert == target_expert_id:
-                print(f"   Actual most expert: Expert-{most_used_expert} ({most_used_ratio:.3f}) - OK!")
-            else:
-                print(f"   Actual most expert: Expert-{most_used_expert} ({most_used_ratio:.3f}) - No")
-        
-        print("="*60)
+        return hidden_states, torch.tensor(0.0, device=hidden_states.device)
 
     @staticmethod
     def state_dict_converter():
