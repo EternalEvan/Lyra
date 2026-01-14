@@ -1,4 +1,4 @@
-#融合nuscenes和sekai数据集的MoE训练
+# Mixture of Experts (MoE) training for fusing NuScenes and Sekai datasets
 import torch
 import torch.nn as nn
 import lightning as pl
@@ -9,58 +9,58 @@ import json
 import numpy as np
 import random
 import traceback
-from diffsynth import WanVideoReCamMasterPipeline, ModelManager
+from diffsynth import WanVideoAstraPipeline, ModelManager
 from torchvision.transforms import v2
 from einops import rearrange
 from pose_classifier import PoseClassifier
 import argparse
 from scipy.spatial.transform import Rotation as R
 
-def get_traj_position_change(cam_c2w, stride=1):
-    positions = cam_c2w[:, :3, 3]
+# def get_traj_position_change(cam_c2w, stride=1):
+#     positions = cam_c2w[:, :3, 3]
     
-    traj_coord = []
-    tarj_angle = []
-    for i in range(0, len(positions) - 2 * stride):
-        v1 = positions[i + stride] - positions[i]
-        v2 = positions[i + 2 * stride] - positions[i + stride]
+#     traj_coord = []
+#     tarj_angle = []
+#     for i in range(0, len(positions) - 2 * stride):
+#         v1 = positions[i + stride] - positions[i]
+#         v2 = positions[i + 2 * stride] - positions[i + stride]
 
-        norm1 = np.linalg.norm(v1)
-        norm2 = np.linalg.norm(v2)
-        if norm1 < 1e-6 or norm2 < 1e-6:
-            continue
+#         norm1 = np.linalg.norm(v1)
+#         norm2 = np.linalg.norm(v2)
+#         if norm1 < 1e-6 or norm2 < 1e-6:
+#             continue
 
-        cos_angle = np.dot(v1, v2) / (norm1 * norm2)
-        angle = np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
+#         cos_angle = np.dot(v1, v2) / (norm1 * norm2)
+#         angle = np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
 
-        traj_coord.append(v1)
-        tarj_angle.append(angle)
+#         traj_coord.append(v1)
+#         tarj_angle.append(angle)
     
-    return traj_coord, tarj_angle
+#     return traj_coord, tarj_angle
 
-def get_traj_rotation_change(cam_c2w, stride=1):
-    rotations = cam_c2w[:, :3, :3]
+# def get_traj_rotation_change(cam_c2w, stride=1):
+#     rotations = cam_c2w[:, :3, :3]
     
-    traj_rot_angle = []
-    for i in range(0, len(rotations) - stride):
-        z1 = rotations[i][:, 2]
-        z2 = rotations[i + stride][:, 2]
+#     traj_rot_angle = []
+#     for i in range(0, len(rotations) - stride):
+#         z1 = rotations[i][:, 2]
+#         z2 = rotations[i + stride][:, 2]
 
-        norm1 = np.linalg.norm(z1)
-        norm2 = np.linalg.norm(z2)
-        if norm1 < 1e-6 or norm2 < 1e-6:
-            continue
+#         norm1 = np.linalg.norm(z1)
+#         norm2 = np.linalg.norm(z2)
+#         if norm1 < 1e-6 or norm2 < 1e-6:
+#             continue
 
-        cos_angle = np.dot(z1, z2) / (norm1 * norm2)
-        angle = np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
-        traj_rot_angle.append(angle)
+#         cos_angle = np.dot(z1, z2) / (norm1 * norm2)
+#         angle = np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
+#         traj_rot_angle.append(angle)
 
-    return traj_rot_angle
+#     return traj_rot_angle
 
 def compute_relative_pose(pose_a, pose_b, use_torch=False):
-    """计算相机B相对于相机A的相对位姿矩阵"""
-    assert pose_a.shape == (4, 4), f"相机A外参矩阵形状应为(4,4)，实际为{pose_a.shape}"
-    assert pose_b.shape == (4, 4), f"相机B外参矩阵形状应为(4,4)，实际为{pose_b.shape}"
+    """Compute the relative pose matrix of camera B with respect to camera A"""
+    assert pose_a.shape == (4, 4), f"Camera A extrinsic matrix shape must be (4,4), got {pose_a.shape}"
+    assert pose_b.shape == (4, 4), f"Camera B extrinsic matrix shape must be (4,4), got {pose_b.shape}"
     
     if use_torch:
         if not isinstance(pose_a, torch.Tensor):
@@ -68,8 +68,8 @@ def compute_relative_pose(pose_a, pose_b, use_torch=False):
         if not isinstance(pose_b, torch.Tensor):
             pose_b = torch.from_numpy(pose_b).float()
         
-        pose_a_inv = torch.inverse(pose_a)
-        relative_pose = torch.matmul(pose_b, pose_a_inv)
+        pose_a_inv = torch.inverse(pose_a.float())
+        relative_pose = torch.matmul(pose_b.float(), pose_a_inv)
     else:
         if not isinstance(pose_a, np.ndarray):
             pose_a = np.array(pose_a, dtype=np.float32)
@@ -83,49 +83,54 @@ def compute_relative_pose(pose_a, pose_b, use_torch=False):
 
 def compute_relative_pose_matrix(pose1, pose2):
     """
-    计算相邻两帧的相对位姿，返回3×4的相机矩阵 [R_rel | t_rel]
+    Compute the relative pose between two adjacent frames, returning a 3x4 camera matrix [R_rel | t_rel]
     
-    参数:
-    pose1: 第i帧的相机位姿，形状为(7,)的数组 [tx1, ty1, tz1, qx1, qy1, qz1, qw1]
-    pose2: 第i+1帧的相机位姿，形状为(7,)的数组 [tx2, ty2, tz2, qx2, qy2, qz2, qw2]
+    Args:
+    pose1: Camera pose of frame i, an array of shape (7,) [tx1, ty1, tz1, qx1, qy1, qz1, qw1]
+    pose2: Camera pose of frame i+1, an array of shape (7,) [tx2, ty2, tz2, qx2, qy2, qz2, qw2]
     
-    返回:
-    relative_matrix: 3×4的相对位姿矩阵，前3列是旋转矩阵R_rel，第4列是平移向量t_rel
+    Returns:
+    relative_matrix: 3x4 relative pose matrix, first 3 columns are rotation matrix R_rel, 4th column is translation vector t_rel
     """
-    # 分离平移向量和四元数
-    t1 = pose1[:3]  # 第i帧平移 [tx1, ty1, tz1]
-    q1 = pose1[3:]  # 第i帧四元数 [qx1, qy1, qz1, qw1]
-    t2 = pose2[:3]  # 第i+1帧平移
-    q2 = pose2[3:]  # 第i+1帧四元数
     
-    # 1. 计算相对旋转矩阵 R_rel
-    rot1 = R.from_quat(q1)  # 第i帧旋转
-    rot2 = R.from_quat(q2)  # 第i+1帧旋转
-    rot_rel = rot2 * rot1.inv()  # 相对旋转 = 后一帧旋转 × 前一帧旋转的逆
-    R_rel = rot_rel.as_matrix()  # 转换为3×3矩阵
+    pose1 = pose1.detach().to(torch.float64).cpu().numpy()
+    pose2 = pose2.detach().to(torch.float64).cpu().numpy()
     
-    # 2. 计算相对平移向量 t_rel
-    R1_T = rot1.as_matrix().T  # 前一帧旋转矩阵的转置（等价于逆）
-    t_rel = R1_T @ (t2 - t1)   # 相对平移 = R1^T × (t2 - t1)
     
-    # 3. 组合为3×4矩阵 [R_rel | t_rel]
+    # Separate translation vector and quaternion
+    t1 = pose1[:3]  # Translation of frame i [tx1, ty1, tz1]
+    q1 = pose1[3:]  # Quaternion of frame i [qx1, qy1, qz1, qw1]
+    t2 = pose2[:3]  # Translation of frame i+1
+    q2 = pose2[3:]  # Quaternion of frame i+1
+    
+    # 1. Compute relative rotation matrix R_rel
+    rot1 = R.from_quat(q1)  # Rotation of frame i
+    rot2 = R.from_quat(q2)  # Rotation of frame i+1
+    rot_rel = rot2 * rot1.inv()  # Relative rotation = Rotation of next frame x Inverse of previous frame rotation
+    R_rel = rot_rel.as_matrix()  # Convert to 3x3 matrix
+    
+    # 2. Compute relative translation vector t_rel
+    R1_T = rot1.as_matrix().T  # Transpose of previous frame rotation matrix (equivalent to inverse)
+    t_rel = R1_T @ (t2 - t1)   # Relative translation = R1^T x (t2 - t1)
+    
+    # 3. Combine into 3x4 matrix [R_rel | t_rel]
     relative_matrix = np.hstack([R_rel, t_rel.reshape(3, 1)])
     
     return relative_matrix
 
 class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
-    """支持FramePack机制的多数据集动态历史长度数据集 - 融合nuscenes和sekai"""
+    """Multi-Dataset Dynamic History Length Dataset supporting FramePack mechanism - Fusing NuScenes and Sekai"""
     
     def __init__(self, dataset_configs, steps_per_epoch, 
                  min_condition_frames=10, max_condition_frames=40,
                  target_frames=10, height=900, width=1600):
         """
         Args:
-            dataset_configs: 数据集配置列表，每个配置包含 {
-                'name': 数据集名称,
-                'paths': 数据集路径列表,
-                'type': 数据集类型 ('sekai' 或 'nuscenes'),
-                'weight': 采样权重
+            dataset_configs: List of dataset configurations, each containing {
+                'name': Dataset name,
+                'paths': List of dataset paths,
+                'type': Dataset type ('sekai' or 'nuscenes'),
+                'weight': Sampling weight
             }
         """
         self.dataset_configs = dataset_configs
@@ -137,35 +142,39 @@ class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
         self.steps_per_epoch = steps_per_epoch
         self.pose_classifier = PoseClassifier()
         
-        # VAE时间压缩比例
+        # VAE time compression ratio
         self.time_compression_ratio = 4
         
-        # 🔧 扫描所有数据集，建立统一的场景索引
+        # 🔧 Scan all datasets, build a unified scene index
         self.scene_dirs = []
-        self.dataset_info = {}  # 记录每个场景的数据集信息
-        self.dataset_weights = []  # 每个场景的采样权重
+        self.dataset_info = {}  # Record dataset information for each scene
+        self.dataset_weights = []  # Sampling weight for each scene
         
         total_scenes = 0
         
         for config in self.dataset_configs:
             dataset_name = config['name']
-            dataset_paths = config['paths'] if isinstance(config['paths'], list) else [config['paths']]
+            # dataset_paths = config['paths'] if isinstance(config['paths'], list) else [config['paths']]
+            dataset_manifests = config['manifest'] if isinstance(config['manifest'], list) else [config['manifest']]
             dataset_type = config['type']
             dataset_weight = config.get('weight', 1.0)
             
-            print(f"🔧 扫描数据集: {dataset_name} (类型: {dataset_type})")
+            print(f"🔧 Scanning dataset: {dataset_name} (Type: {dataset_type})")
             
             dataset_scenes = []
-            for dataset_path in dataset_paths:
-                print(f"  📁 检查路径: {dataset_path}")
-                if os.path.exists(dataset_path):                    
-                    if dataset_type == 'nuscenes':
-                        # NuScenes使用 base_path/scenes 结构
-                        scenes_path = os.path.join(dataset_path, "scenes")
-                        print(f"  📂 扫描NuScenes scenes目录: {scenes_path}")
-                        for item in os.listdir(scenes_path):
-                            scene_dir = os.path.join(scenes_path, item)
-                            if os.path.isdir(scene_dir):
+            for dataset_manifest in dataset_manifests:
+                print(f"  📁 Checking path: {dataset_manifest}")
+                if os.path.exists(dataset_manifest):
+                    with open(dataset_manifest, "r") as f:
+                        data = json.load(f)
+                        pth_list = [d["pth"] for d in data["entries"]]
+                        print(f"  📁 Found {len(pth_list)} paths in manifest")
+                        for pth in pth_list:
+                            scene_dir = os.path.join("/mnt/data/louis_crq/preprocessed_data/SpatialVID_Wan2", pth)
+                            if not os.path.exists(scene_dir):
+                                print(f"  ❌ Path does not exist: {scene_dir}")
+                                continue
+                            else:
                                 self.scene_dirs.append(scene_dir)
                                 dataset_scenes.append(scene_dir)
                                 self.dataset_info[scene_dir] = {
@@ -173,30 +182,14 @@ class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
                                     'type': dataset_type,
                                     'weight': dataset_weight
                                 }
-                                self.dataset_weights.append(dataset_weight)
-
-                    elif dataset_type in ['sekai', 'spatialvid', 'openx']:  # 🔧 添加openx类型
-                        # Sekai、spatialvid、OpenX等数据集直接扫描根目录
-                        for item in os.listdir(dataset_path):
-                            scene_dir = os.path.join(dataset_path, item)
-                            if os.path.isdir(scene_dir):
-                                encoded_path = os.path.join(scene_dir, "encoded_video.pth")
-                                if os.path.exists(encoded_path):
-                                    self.scene_dirs.append(scene_dir)
-                                    dataset_scenes.append(scene_dir)
-                                    self.dataset_info[scene_dir] = {
-                                        'name': dataset_name,
-                                        'type': dataset_type,
-                                        'weight': dataset_weight
-                                    }
-                                    self.dataset_weights.append(dataset_weight)
+                                self.dataset_weights.append(dataset_weight)      
                 else:
-                    print(f"  ❌ 路径不存在: {dataset_path}")
+                    print(f"  ❌ Path does not exist: {dataset_manifest}")
                 
-                print(f"  ✅ 找到 {len(dataset_scenes)} 个场景")
+                print(f"  ✅ Found {len(dataset_scenes)} scenes")
                 total_scenes += len(dataset_scenes)
                     
-        # 统计各数据集场景数
+        # Count scenes per dataset
         dataset_counts = {}
         for scene_dir in self.scene_dirs:
             dataset_name = self.dataset_info[scene_dir]['name']
@@ -205,23 +198,23 @@ class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
             dataset_counts[key] = dataset_counts.get(key, 0) + 1
         
         for dataset_key, count in dataset_counts.items():
-            print(f"  - {dataset_key}: {count} 个场景")
+            print(f"  - {dataset_key}: {count} scenes")
         
         assert len(self.scene_dirs) > 0, "No encoded scenes found!"
         
-        # 🔧 计算采样概率
+        # 🔧 Calculate sampling probabilities
         total_weight = sum(self.dataset_weights)
         self.sampling_probs = [w / total_weight for w in self.dataset_weights]
 
     def select_dynamic_segment_nuscenes(self, scene_info):
-        """🔧 NuScenes专用的FramePack风格段落选择"""
-        keyframe_indices = scene_info['keyframe_indices']  # 原始帧索引
-        total_frames = scene_info['total_frames']  # 原始总帧数
+        """🔧 NuScenes specific FramePack style segment selection"""
+        keyframe_indices = scene_info['keyframe_indices']  # Original frame indices
+        total_frames = scene_info['total_frames']  # Original total frames
         
         if len(keyframe_indices) < 2:
             return None
         
-        # 计算压缩后的帧数
+        # Calculate compressed frame count
         compressed_total_frames = total_frames // self.time_compression_ratio
         compressed_keyframe_indices = [idx // self.time_compression_ratio for idx in keyframe_indices]
         
@@ -229,7 +222,7 @@ class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
         max_condition_compressed = self.max_condition_frames // self.time_compression_ratio
         target_frames_compressed = self.target_frames // self.time_compression_ratio
         
-        # FramePack风格的采样策略
+        # FramePack style sampling strategy
         ratio = random.random()
         if ratio < 0.15:
             condition_frames_compressed = 1
@@ -238,7 +231,7 @@ class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
         else:
             condition_frames_compressed = target_frames_compressed
         
-        # 确保有足够的帧数
+        # Ensure enough frames
         min_required_frames = condition_frames_compressed + target_frames_compressed
         if compressed_total_frames < min_required_frames:
             return None
@@ -247,32 +240,32 @@ class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
         condition_end_compressed = start_frame_compressed + condition_frames_compressed
         target_end_compressed = condition_end_compressed + target_frames_compressed
 
-        # FramePack风格的索引处理
+        # FramePack style index handling
         latent_indices = torch.arange(condition_end_compressed, target_end_compressed)
         
-        # 1x帧：起始帧 + 最后1帧
+        # 1x frames: Start frame + Last 1 frame
         clean_latent_indices_start = torch.tensor([start_frame_compressed])
         clean_latent_1x_indices = torch.tensor([condition_end_compressed - 1])
         clean_latent_indices = torch.cat([clean_latent_indices_start, clean_latent_1x_indices])
         
-        # 🔧 2x帧：根据实际condition长度确定
+        # 🔧 2x frames: Determined by actual condition length
         if condition_frames_compressed >= 2:
-            # 取最后2帧（如果有的话）
+            # Take last 2 frames (if available)
             clean_latent_2x_start = max(start_frame_compressed, condition_end_compressed - 2)
             clean_latent_2x_indices = torch.arange(clean_latent_2x_start-1, condition_end_compressed-1)
         else:
-            # 如果condition帧数不足2帧，创建空索引
+            # If not enough condition frames (< 2), create empty indices
             clean_latent_2x_indices = torch.tensor([], dtype=torch.long)
         
-        # 🔧 4x帧：根据实际condition长度确定，最多16帧
+        # 🔧 4x frames: Determined by actual condition length, max 16 frames
         if condition_frames_compressed >= 1:
-            # 取最多16帧的历史（如果有的话）
+            # Take max 16 frames of history (if available)
             clean_4x_start = max(start_frame_compressed, condition_end_compressed - 16)
             clean_latent_4x_indices = torch.arange(clean_4x_start-3, condition_end_compressed-3)
         else:
             clean_latent_4x_indices = torch.tensor([], dtype=torch.long)
                     
-        # 🔧 NuScenes特有：查找关键帧索引
+        # 🔧 NuScenes specific: Find keyframe indices
         condition_keyframes_compressed = [idx for idx in compressed_keyframe_indices 
                                         if start_frame_compressed <= idx < condition_end_compressed]
         
@@ -282,10 +275,10 @@ class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
         if not condition_keyframes_compressed:
             return None
         
-        # 使用条件段的最后一个关键帧作为reference
+        # Use the last keyframe of the condition segment as reference
         reference_keyframe_compressed = max(condition_keyframes_compressed)
         
-        # 找到对应的原始关键帧索引用于pose查找
+        # Find the corresponding original keyframe index for pose lookup
         reference_keyframe_original_idx = None
         for i, compressed_idx in enumerate(compressed_keyframe_indices):
             if compressed_idx == reference_keyframe_compressed:
@@ -295,7 +288,7 @@ class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
         if reference_keyframe_original_idx is None:
             return None
         
-        # 找到目标段对应的原始关键帧索引
+        # Find the corresponding original keyframe index for the target segment
         target_keyframes_original_indices = []
         for compressed_idx in target_keyframes_compressed:
             for i, comp_idx in enumerate(compressed_keyframe_indices):
@@ -303,7 +296,7 @@ class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
                     target_keyframes_original_indices.append(i)
                     break
         
-        # 对应的原始关键帧索引
+        # Corresponding original keyframe indices
         keyframe_original_idx = []
         for compressed_idx in range(start_frame_compressed, target_end_compressed):
             keyframe_original_idx.append(compressed_idx * 4)
@@ -315,7 +308,7 @@ class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
             'condition_range': (start_frame_compressed, condition_end_compressed),
             'target_range': (condition_end_compressed, target_end_compressed),
             
-            # FramePack风格的索引
+            # FramePack style indices
             'latent_indices': latent_indices,
             'clean_latent_indices': clean_latent_indices,
             'clean_latent_2x_indices': clean_latent_2x_indices,
@@ -325,13 +318,13 @@ class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
             'original_condition_frames': condition_frames_compressed * self.time_compression_ratio,
             'original_target_frames': target_frames_compressed * self.time_compression_ratio,
             
-            # 🔧 NuScenes特有数据
+            # 🔧 NuScenes specific data
             'reference_keyframe_idx': reference_keyframe_original_idx,
             'target_keyframe_indices': target_keyframes_original_indices,
         }
 
     def calculate_relative_rotation(self, current_rotation, reference_rotation):
-        """计算相对旋转四元数 - NuScenes专用"""
+        """Compute relative rotation quaternion - NuScenes specific"""
         q_current = torch.tensor(current_rotation, dtype=torch.float32)
         q_ref = torch.tensor(reference_rotation, dtype=torch.float32)
 
@@ -351,59 +344,59 @@ class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
 
 
     def prepare_framepack_inputs(self, full_latents, segment_info):
-        """🔧 准备FramePack风格的多尺度输入 - 修正版，正确处理空索引"""
-        # 🔧 修正：处理4维输入 [C, T, H, W]，添加batch维度
+        """🔧 Prepare FramePack style multi-scale inputs - Revised version, correctly handling empty indices"""
+        # 🔧 Correction: Handle 4D input [C, T, H, W], add batch dimension
         if len(full_latents.shape) == 4:
             full_latents = full_latents.unsqueeze(0)  # [C, T, H, W] -> [1, C, T, H, W]
             B, C, T, H, W = full_latents.shape
         else:
             B, C, T, H, W = full_latents.shape
         
-        # 主要latents（用于去噪预测）
+        # Main latents (for denoising prediction)
         latent_indices = segment_info['latent_indices']
-        main_latents = full_latents[:, :, latent_indices, :, :]  # 注意维度顺序
+        main_latents = full_latents[:, :, latent_indices, :, :]  # Note dimension order
         
-        # 🔧 1x条件帧（起始帧 + 最后1帧）
+        # 🔧 1x condition frames (Start frame + Last 1 frame)
         clean_latent_indices = segment_info['clean_latent_indices']
-        clean_latents = full_latents[:, :, clean_latent_indices, :, :]  # 注意维度顺序
+        clean_latents = full_latents[:, :, clean_latent_indices, :, :]  # Note dimension order
         
-        # 🔧 4x条件帧 - 总是16帧，直接用真实索引 + 0填充
+        # 🔧 4x condition frames - Always 16 frames, use real indices + 0 padding
         clean_latent_4x_indices = segment_info['clean_latent_4x_indices']
         
-        # 创建固定长度16的latents，初始化为0
+        # Create fixed length 16 latents, initialized to 0
         clean_latents_4x = torch.zeros(B, C, 16, H, W, dtype=full_latents.dtype)
-        clean_latent_4x_indices_final = torch.full((16,), -1, dtype=torch.long)  # -1表示padding
+        clean_latent_4x_indices_final = torch.full((16,), -1, dtype=torch.long)  # -1 means padding
         
-        # 🔧 修正：检查是否有有效的4x索引
+        # 🔧 Correction: Check if there are valid 4x indices
         if len(clean_latent_4x_indices) > 0:
             actual_4x_frames = len(clean_latent_4x_indices)
-            # 从后往前填充，确保最新的帧在最后
+            # Fill from back to front, ensuring the latest frames are at the end
             start_pos = max(0, 16 - actual_4x_frames)
             end_pos = 16
-            actual_start = max(0, actual_4x_frames - 16)  # 如果超过16帧，只取最后16帧
+            actual_start = max(0, actual_4x_frames - 16)  # If more than 16 frames, only take the last 16
             
             clean_latents_4x[:, :, start_pos:end_pos, :, :] = full_latents[:, :, clean_latent_4x_indices[actual_start:], :, :]
             clean_latent_4x_indices_final[start_pos:end_pos] = clean_latent_4x_indices[actual_start:]
         
-        # 🔧 2x条件帧 - 总是2帧，直接用真实索引 + 0填充
+        # 🔧 2x condition frames - Always 2 frames, use real indices + 0 padding
         clean_latent_2x_indices = segment_info['clean_latent_2x_indices']
         
-        # 创建固定长度2的latents，初始化为0
+        # Create fixed length 2 latents, initialized to 0
         clean_latents_2x = torch.zeros(B, C, 2, H, W, dtype=full_latents.dtype)
-        clean_latent_2x_indices_final = torch.full((2,), -1, dtype=torch.long)  # -1表示padding
+        clean_latent_2x_indices_final = torch.full((2,), -1, dtype=torch.long)  # -1 means padding
         
-        # 🔧 修正：检查是否有有效的2x索引
+        # 🔧 Correction: Check if there are valid 2x indices
         if len(clean_latent_2x_indices) > 0:
             actual_2x_frames = len(clean_latent_2x_indices)
-            # 从后往前填充，确保最新的帧在最后
+            # Fill from back to front, ensuring the latest frames are at the end
             start_pos = max(0, 2 - actual_2x_frames)
             end_pos = 2
-            actual_start = max(0, actual_2x_frames - 2)  # 如果超过2帧，只取最后2帧
+            actual_start = max(0, actual_2x_frames - 2)  # If more than 2 frames, only take the last 2
             
             clean_latents_2x[:, :, start_pos:end_pos, :, :] = full_latents[:, :, clean_latent_2x_indices[actual_start:], :, :]
             clean_latent_2x_indices_final[start_pos:end_pos] = clean_latent_2x_indices[actual_start:]
         
-        # 🔧 移除添加的batch维度，返回原始格式
+        # 🔧 Remove added batch dimension, return original format
         if B == 1:
             main_latents = main_latents.squeeze(0)  # [1, C, T, H, W] -> [C, T, H, W]
             clean_latents = clean_latents.squeeze(0)
@@ -417,15 +410,15 @@ class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
             'clean_latents_4x': clean_latents_4x,
             'latent_indices': segment_info['latent_indices'],
             'clean_latent_indices': segment_info['clean_latent_indices'],
-            'clean_latent_2x_indices': clean_latent_2x_indices_final,  # 🔧 使用真实索引（含-1填充）
-            'clean_latent_4x_indices': clean_latent_4x_indices_final,  # 🔧 使用真实索引（含-1填充）
+            'clean_latent_2x_indices': clean_latent_2x_indices_final,  # 🔧 Use actual indices (with -1 padding)
+            'clean_latent_4x_indices': clean_latent_4x_indices_final,  # 🔧 Use actual indices (with -1 padding)
         }
 
     def create_sekai_pose_embeddings(self, cam_data, segment_info):
-        """创建Sekai风格的pose embeddings"""
+        """Create Sekai style pose embeddings"""
         cam_data_seq = cam_data['extrinsic']
         
-        # 为所有帧计算相对pose
+        # Compute relative pose for all frames
         all_keyframe_indices = []
         for compressed_idx in range(segment_info['start_frame'], segment_info['target_range'][1]):
             all_keyframe_indices.append(compressed_idx * 4)
@@ -444,10 +437,10 @@ class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
         return pose_embedding
 
     def create_openx_pose_embeddings(self, cam_data, segment_info):
-        """🔧 创建OpenX风格的pose embeddings - 类似sekai但处理更短的序列"""
+        """🔧 Create OpenX style pose embeddings - similar to sekai but handles shorter sequences"""
         cam_data_seq = cam_data['extrinsic']
         
-        # 为所有帧计算相对pose - OpenX使用4倍间隔
+        # Compute relative pose for all frames - OpenX uses 4x interval
         all_keyframe_indices = []
         for compressed_idx in range(segment_info['start_frame'], segment_info['target_range'][1]):
             keyframe_idx = compressed_idx * 4
@@ -462,7 +455,7 @@ class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
                 relative_cam = compute_relative_pose(cam_prev, cam_next)
                 relative_cams.append(torch.as_tensor(relative_cam[:3, :]))
             else:
-                # 如果没有下一帧，使用单位矩阵
+                # If no next frame, use identity matrix
                 identity_cam = torch.eye(3, 4)
                 relative_cams.append(identity_cam)
         
@@ -476,22 +469,22 @@ class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
         return pose_embedding
     
     def create_spatialvid_pose_embeddings(self, cam_data, segment_info):
-        """🔧 创建SpatialVid风格的pose embeddings - camera间隔为1帧而非4帧"""
+        """🔧 Create SpatialVid style pose embeddings - camera interval is 1 frame instead of 4 frames"""
         cam_data_seq = cam_data['extrinsic']   # N * 4 * 4
         
-        # 🔧 为所有帧（condition + target）计算camera embedding
-        # SpatialVid特有：每隔1帧而不是4帧
+        # 🔧 Compute camera embedding for all frames (condition + target)
+        # SpatialVid specific: Every 1 frame instead of 4 frames
         keyframe_original_idx = segment_info['keyframe_original_idx']
         
         relative_cams = []
         for idx in keyframe_original_idx:
             if idx + 1 < len(cam_data_seq):
                 cam_prev = cam_data_seq[idx]
-                cam_next = cam_data_seq[idx + 1]  # SpatialVid: 每隔1帧
+                cam_next = cam_data_seq[idx + 1]  # SpatialVid: Every 1 frame
                 relative_cam = compute_relative_pose_matrix(cam_prev, cam_next)
                 relative_cams.append(torch.as_tensor(relative_cam[:3, :]))
             else:
-                # 如果没有下一帧，使用零运动
+                # If no next frame, use zero motion
                 identity_cam = torch.zeros(3, 4)
                 relative_cams.append(identity_cam)
         
@@ -505,7 +498,7 @@ class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
         return pose_embedding
                
     def create_nuscenes_pose_embeddings_framepack(self, scene_info, segment_info):
-        """创建NuScenes风格的pose embeddings - FramePack版本（简化版本，直接7维）"""
+        """Create NuScenes style pose embeddings - FramePack version (simplified to 7D)"""
         keyframe_poses = scene_info['keyframe_poses']
         reference_keyframe_idx = segment_info['reference_keyframe_idx']
         target_keyframe_indices = segment_info['target_keyframe_indices']
@@ -515,19 +508,19 @@ class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
         
         reference_pose = keyframe_poses[reference_keyframe_idx]
         
-        # 为所有帧（condition + target）创建pose embeddings
+        # Create pose embeddings for all frames (condition + target)
         start_frame = segment_info['start_frame']
         condition_end_compressed = start_frame + segment_info['condition_frames']
         target_end_compressed = condition_end_compressed + segment_info['target_frames']
         
-        # 压缩后的关键帧索引
+        # Compressed keyframe indices
         compressed_keyframe_indices = [idx // self.time_compression_ratio for idx in scene_info['keyframe_indices']]
         
-        # 找到condition段的关键帧
+        # Find keyframes in the condition segment
         condition_keyframes_compressed = [idx for idx in compressed_keyframe_indices 
                                         if start_frame <= idx < condition_end_compressed]
         
-        # 找到对应的原始关键帧索引
+        # Find corresponding original keyframe indices
         condition_keyframes_original_indices = []
         for compressed_idx in condition_keyframes_compressed:
             for i, comp_idx in enumerate(compressed_keyframe_indices):
@@ -537,13 +530,13 @@ class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
         
         pose_vecs = []
         
-        # 为condition帧计算pose
+        # Compute pose for condition frames
         for i in range(segment_info['condition_frames']):
             if not condition_keyframes_original_indices:
                 translation = torch.zeros(3, dtype=torch.float32)
                 rotation = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float32)
             else:
-                # 为condition帧分配pose
+                # Assign pose for condition frames
                 if len(condition_keyframes_original_indices) == 1:
                     keyframe_idx = condition_keyframes_original_indices[0]
                 else:
@@ -572,11 +565,11 @@ class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
                     
                     rotation = relative_rotation
             
-            # 🔧 简化：直接7维 [translation(3) + rotation(4)]
+            # 🔧 Simplified: Direct 7D [translation(3) + rotation(4)]
             pose_vec = torch.cat([translation, rotation], dim=0)  # [7D]
             pose_vecs.append(pose_vec)
         
-        # 为target帧计算pose
+        # Compute pose for target frames
         if not target_keyframe_indices:
             for i in range(segment_info['target_frames']):
                 pose_vec = torch.cat([
@@ -614,7 +607,7 @@ class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
                         reference_pose['rotation']
                     )
                     
-                    # 🔧 简化：直接7维 [translation(3) + rotation(4)]
+                    # 🔧 Simplified: Direct 7D [translation(3) + rotation(4)]
                     pose_vec = torch.cat([relative_translation, relative_rotation], dim=0)  # [7D]
                 
                 pose_vecs.append(pose_vec)
@@ -626,13 +619,24 @@ class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
         
         return pose_sequence
 
-    # 修改select_dynamic_segment方法
+    # Modify create_pose_embeddings method
+    def create_pose_embeddings(self, cam_data, segment_info, dataset_type, scene_info=None):
+        """🔧 Create pose embeddings based on dataset type"""
+        if dataset_type == 'nuscenes' and scene_info is not None:
+            return self.create_nuscenes_pose_embeddings_framepack(scene_info, segment_info)
+        elif dataset_type == 'spatialvid':  # 🔧 Added spatialvid handling
+            return self.create_spatialvid_pose_embeddings(cam_data, segment_info)
+        elif dataset_type == 'sekai':
+            return self.create_sekai_pose_embeddings(cam_data, segment_info)
+        elif dataset_type == 'openx':  # 🔧 Added openx handling
+            return self.create_openx_pose_embeddings(cam_data, segment_info)
+
     def select_dynamic_segment(self, full_latents, dataset_type, scene_info=None):
-        """🔧 根据数据集类型选择不同的段落选择策略"""
+        """🔧 Select different segment selection strategy based on dataset type"""
         if dataset_type == 'nuscenes' and scene_info is not None:
             return self.select_dynamic_segment_nuscenes(scene_info)
         else:
-            # 原有的sekai方式
+            # Original sekai method
             total_lens = full_latents.shape[1]
             
             min_condition_compressed = self.min_condition_frames // self.time_compression_ratio
@@ -640,15 +644,26 @@ class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
             target_frames_compressed = self.target_frames // self.time_compression_ratio
             max_condition_compressed = min(total_lens-target_frames_compressed-1, max_condition_compressed)
 
-            ratio = random.random()
-            if ratio < 0.15:
-                condition_frames_compressed = 1
-            elif 0.15 <= ratio < 0.9 or total_lens <= 2*target_frames_compressed + 1:
-                condition_frames_compressed = random.randint(min_condition_compressed, max_condition_compressed)
+            # 🔧 New: spatialvid dataset 80% probability uses only the first frame as condition
+            if dataset_type == 'spatialvid':
+                ratio = random.random()
+                if ratio < 0.4:  # 40% probability uses the first frame (actually first_latent.pth)
+                    condition_frames_compressed = 1
+                elif ratio < 0.9:  # 50% probability uses random history length
+                    condition_frames_compressed = random.randint(min_condition_compressed, max_condition_compressed)
+                else:  # 10% probability uses target_frames length
+                    condition_frames_compressed = target_frames_compressed
             else:
-                condition_frames_compressed = target_frames_compressed
+                # Other datasets maintain original logic
+                ratio = random.random()
+                if ratio < 0.15:
+                    condition_frames_compressed = 1
+                elif 0.15 <= ratio < 0.9 or total_lens <= 2*target_frames_compressed + 1:
+                    condition_frames_compressed = random.randint(min_condition_compressed, max_condition_compressed)
+                else:
+                    condition_frames_compressed = target_frames_compressed
             
-            # 确保有足够的帧数
+            # Ensure enough frames
             min_required_frames = condition_frames_compressed + target_frames_compressed
             if total_lens < min_required_frames:
                 return None
@@ -657,38 +672,35 @@ class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
             condition_end_compressed = start_frame_compressed + condition_frames_compressed
             target_end_compressed = condition_end_compressed + target_frames_compressed
 
-            # FramePack风格的索引处理
+            # FramePack style index handling
             latent_indices = torch.arange(condition_end_compressed, target_end_compressed)
             
-            # 1x帧：起始帧 + 最后1帧
+            # 1x frames: Start frame + Last 1 frame
             clean_latent_indices_start = torch.tensor([start_frame_compressed])
             clean_latent_1x_indices = torch.tensor([condition_end_compressed - 1])
             clean_latent_indices = torch.cat([clean_latent_indices_start, clean_latent_1x_indices])
             
-            # 🔧 2x帧：根据实际condition长度确定
+            # 🔧 2x frames: Determined by actual condition length
             if condition_frames_compressed >= 2:
-                # 取最后2帧（如果有的话）
                 clean_latent_2x_start = max(start_frame_compressed, condition_end_compressed - 2-1)
                 clean_latent_2x_indices = torch.arange(clean_latent_2x_start, condition_end_compressed-1)
             else:
-                # 如果condition帧数不足2帧，创建空索引
                 clean_latent_2x_indices = torch.tensor([], dtype=torch.long)
             
-            # 🔧 4x帧：根据实际condition长度确定，最多16帧
+            # 🔧 4x frames: Determined by actual condition length, max 16 frames
             if condition_frames_compressed > 3:
-                # 取最多16帧的历史（如果有的话）
                 clean_4x_start = max(start_frame_compressed, condition_end_compressed - 16-3)
                 clean_latent_4x_indices = torch.arange(clean_4x_start, condition_end_compressed-3)
             else:
                 clean_latent_4x_indices = torch.tensor([], dtype=torch.long)
             
-            # 对应的原始关键帧索引
+            # Corresponding original keyframe indices
             keyframe_original_idx = []
             for compressed_idx in range(start_frame_compressed, target_end_compressed):
                 if dataset_type == 'spatialvid':
-                    keyframe_original_idx.append(compressed_idx)  # spatialvid直接使用compressed_idx
-                elif dataset_type == 'openx' or 'sekai':  # 🔧 新增openx处理
-                    keyframe_original_idx.append(compressed_idx * 4)  # openx使用4倍间隔
+                    keyframe_original_idx.append(compressed_idx)
+                elif dataset_type == 'openx' or 'sekai':
+                    keyframe_original_idx.append(compressed_idx * 4)
 
             return {
                 'start_frame': start_frame_compressed,
@@ -697,7 +709,7 @@ class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
                 'condition_range': (start_frame_compressed, condition_end_compressed),
                 'target_range': (condition_end_compressed, target_end_compressed),
                 
-                # FramePack风格的索引
+                # FramePack style indices
                 'latent_indices': latent_indices,
                 'clean_latent_indices': clean_latent_indices,
                 'clean_latent_2x_indices': clean_latent_2x_indices,
@@ -706,24 +718,15 @@ class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
                 'keyframe_original_idx': keyframe_original_idx,
                 'original_condition_frames': condition_frames_compressed * self.time_compression_ratio,
                 'original_target_frames': target_frames_compressed * self.time_compression_ratio,
+                
+                # 🔧 New: Flag whether to use first_latent
+                'use_first_latent': dataset_type == 'spatialvid' and condition_frames_compressed == 1,
             }
 
-    # 修改create_pose_embeddings方法
-    def create_pose_embeddings(self, cam_data, segment_info, dataset_type, scene_info=None):
-        """🔧 根据数据集类型创建pose embeddings"""
-        if dataset_type == 'nuscenes' and scene_info is not None:
-            return self.create_nuscenes_pose_embeddings_framepack(scene_info, segment_info)
-        elif dataset_type == 'spatialvid':  # 🔧 新增spatialvid处理
-            return self.create_spatialvid_pose_embeddings(cam_data, segment_info)
-        elif dataset_type == 'sekai':
-            return self.create_sekai_pose_embeddings(cam_data, segment_info)
-        elif dataset_type == 'openx':  # 🔧 新增openx处理
-            return self.create_openx_pose_embeddings(cam_data, segment_info)
-        
     def __getitem__(self, index):
         while True:
             try:
-                # 根据权重随机选择场景
+                # Randomly select scene based on weight
                 scene_idx = np.random.choice(len(self.scene_dirs), p=self.sampling_probs)
                 scene_dir = self.scene_dirs[scene_idx]
                 dataset_info = self.dataset_info[scene_dir]
@@ -731,24 +734,22 @@ class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
                 dataset_name = dataset_info['name']
                 dataset_type = dataset_info['type']
                 
-                # 🔧 根据数据集类型加载数据
+                # 🔧 Load data based on dataset type
                 scene_info = None
                 if dataset_type == 'nuscenes':
-                    # NuScenes需要加载scene_info.json
                     scene_info_path = os.path.join(scene_dir, "scene_info.json")
                     if os.path.exists(scene_info_path):
                         with open(scene_info_path, 'r') as f:
                             scene_info = json.load(f)
                     
-                    # NuScenes使用不同的编码文件名
                     encoded_path = os.path.join(scene_dir, "encoded_video-480p.pth")
                     if not os.path.exists(encoded_path):
-                        encoded_path = os.path.join(scene_dir, "encoded_video.pth")  # fallback
+                        encoded_path = os.path.join(scene_dir, "encoded_video.pth")
                     
                     encoded_data = torch.load(encoded_path, weights_only=True, map_location="cpu")
                 else:
-                    # Sekai数据集
-                    encoded_path = os.path.join(scene_dir, "encoded_video.pth")
+                    # encoded_path = os.path.join(scene_dir, "encoded_video.pth")
+                    encoded_path = scene_dir
                     encoded_data = torch.load(encoded_path, weights_only=False, map_location="cpu")
                 
                 full_latents = encoded_data['latents']
@@ -756,45 +757,63 @@ class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
                     continue
                 cam_data = encoded_data.get('cam_emb', encoded_data)
                 
-                # 🔧 验证NuScenes的latent帧数
+                # 🔧 Validate NuScenes latent frame count
                 if dataset_type == 'nuscenes' and scene_info is not None:
                     expected_latent_frames = scene_info['total_frames'] // self.time_compression_ratio
                     actual_latent_frames = full_latents.shape[1]
                     
                     if abs(actual_latent_frames - expected_latent_frames) > 2:
-                        print(f"⚠️  NuScenes Latent帧数不匹配，跳过此样本")
+                        print(f"⚠️ NuScenes Latent frame count mismatch, skipping sample")
                         continue
                 
-                # 使用数据集特定的段落选择策略
+                # Use dataset-specific segment selection strategy
                 segment_info = self.select_dynamic_segment(full_latents, dataset_type, scene_info)
                 if segment_info is None:
                     continue
                 
-                # 创建数据集特定的pose embeddings
+                # 🔧 New: For spatialvid, if using first_latent, load it
+                if segment_info.get('use_first_latent', False):
+                    # first_latent_path = os.path.join(scene_dir, "first_latent.pth")
+                    first_latent_path = scene_dir.replace(
+                        "SpatialVID_Wan2/","SpatialVID_Wan2_first4/"
+                    ).replace(".pth", "_first4.pth")
+                    if os.path.exists(first_latent_path):
+                        first_latent_data = torch.load(first_latent_path, weights_only=False, map_location="cpu")
+                        # first_latent.pth contains the encoded result of the first frame repeated 4 times
+                        # Shape should be [C, 1, H, W] (because 4 frames are compressed to 1 frame by VAE)
+                        first_latent = first_latent_data['latents_first4']  # [C, 1, H, W]
+                        
+                        # Replace the first frame of full_latents with first_latent
+                        # Note: We keep other frames of full_latents unchanged, only replace the frame used as condition
+                        full_latents[:, 0:1, :, :] = first_latent
+                        
+                        print(f"✅ SpatialVid: Using first_latent.pth as condition (40% probability)")
+                    else:
+                        print(f"⚠️ first_latent.pth does not exist: {first_latent_path}, using original latent")
+                
+                # Create dataset-specific pose embeddings
                 all_camera_embeddings = self.create_pose_embeddings(cam_data, segment_info, dataset_type, scene_info)
                 if all_camera_embeddings is None:
                     continue
                 
-                # 准备FramePack风格的多尺度输入
+                # Prepare FramePack style multi-scale inputs
                 framepack_inputs = self.prepare_framepack_inputs(full_latents, segment_info)
                 
                 n = segment_info["condition_frames"]
                 m = segment_info['target_frames']
                 
-                # 处理camera embedding with mask
+                # Handle camera embedding with mask
                 mask = torch.zeros(n+m, dtype=torch.float32)
                 mask[:n] = 1.0
                 mask = mask.view(-1, 1)
                 
-                # 🔧 NuScenes返回的是直接的embedding，Sekai返回的是tensor
                 if isinstance(all_camera_embeddings, torch.Tensor):
                     camera_with_mask = torch.cat([all_camera_embeddings, mask], dim=1)
                 else:
-                    # NuScenes风格，直接就是最终的embedding
                     camera_with_mask = torch.cat([all_camera_embeddings, mask], dim=1)
                 
                 result = {
-                    # FramePack风格的多尺度输入
+                    # FramePack style multi-scale inputs
                     "latents": framepack_inputs['latents'],
                     "clean_latents": framepack_inputs['clean_latents'],
                     "clean_latents_2x": framepack_inputs['clean_latents_2x'],
@@ -804,14 +823,14 @@ class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
                     "clean_latent_2x_indices": framepack_inputs['clean_latent_2x_indices'],
                     "clean_latent_4x_indices": framepack_inputs['clean_latent_4x_indices'],
                     
-                    # Camera数据
+                    # Camera data
                     "camera": camera_with_mask,
                     
-                    # 其他数据
+                    # Other data
                     "prompt_emb": encoded_data["prompt_emb"],
                     "image_emb": encoded_data.get("image_emb", {}),
                     
-                    # 元信息
+                    # Metadata
                     "condition_frames": n,
                     "target_frames": m,
                     "scene_name": os.path.basename(scene_dir),
@@ -819,6 +838,7 @@ class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
                     "dataset_type": dataset_type,
                     "original_condition_frames": segment_info['original_condition_frames'],
                     "original_target_frames": segment_info['original_target_frames'],
+                    "use_first_latent": segment_info.get('use_first_latent', False),  # 🔧 Add flag
                 }
                 
                 return result
@@ -832,15 +852,15 @@ class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
         return self.steps_per_epoch
 
 def replace_dit_model_in_manager():
-    """在模型加载前替换DiT模型类为MoE版本"""
+    """Replace the DiT model class with the MoE version before model loading"""
     from diffsynth.models.wan_video_dit_moe import WanModelMoe
     from diffsynth.configs.model_config import model_loader_configs
     
-    # 修改model_loader_configs中的配置
+    # Modify config in model_loader_configs
     for i, config in enumerate(model_loader_configs):
         keys_hash, keys_hash_with_shape, model_names, model_classes, model_resource = config
         
-        # 检查是否包含wan_video_dit模型
+        # Check if wan_video_dit model is included
         if 'wan_video_dit' in model_names:
             new_model_names = []
             new_model_classes = []
@@ -848,13 +868,13 @@ def replace_dit_model_in_manager():
             for name, cls in zip(model_names, model_classes):
                 if name == 'wan_video_dit':
                     new_model_names.append(name)
-                    new_model_classes.append(WanModelMoe)  # 🔧 使用MoE版本
-                    print(f"✅ 替换了模型类: {name} -> WanModelMoe")
+                    new_model_classes.append(WanModelMoe)  # 🔧 Use MoE version
+                    print(f"✅ Replaced model class: {name} -> WanModelMoe")
                 else:
                     new_model_names.append(name)
                     new_model_classes.append(cls)
             
-            # 更新配置
+            # Update config
             model_loader_configs[i] = (keys_hash, keys_hash_with_shape, new_model_names, new_model_classes, model_resource)
 
 class MultiDatasetLightningModelForTrain(pl.LightningModule):
@@ -865,7 +885,7 @@ class MultiDatasetLightningModelForTrain(pl.LightningModule):
         use_gradient_checkpointing=True,
         use_gradient_checkpointing_offload=False,
         resume_ckpt_path=None,
-        # 🔧 MoE参数
+        # 🔧 MoE parameters
         use_moe=False,
         moe_config=None
     ):
@@ -880,20 +900,20 @@ class MultiDatasetLightningModelForTrain(pl.LightningModule):
         else:
             dit_path = dit_path.split(",")
             model_manager.load_models([dit_path])
-        model_manager.load_models(["models/Wan-AI/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth"])
+        model_manager.load_models(["/mnt/data/louis_crq/models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth"])
         
-        self.pipe = WanVideoReCamMasterPipeline.from_model_manager(model_manager)
+        self.pipe = WanVideoAstraPipeline.from_model_manager(model_manager)
         self.pipe.scheduler.set_timesteps(1000, training=True)
 
-        # 添加FramePack的clean_x_embedder
+        # Add FramePack's clean_x_embedder
         self.add_framepack_components()
         if self.use_moe:
             self.add_moe_components()
 
-        # 🔧 添加camera编码器（wan_video_dit_moe.py已经包含MoE逻辑）
+        # 🔧 Add camera encoder (MoE logic is already in wan_video_dit_moe.py)
         dim = self.pipe.dit.blocks[0].self_attn.q.weight.shape[0]
         for block in self.pipe.dit.blocks:
-            # 🔧 简化：只添加传统camera编码器，MoE逻辑在wan_video_dit_moe.py中
+            # 🔧 Simplified: Only add traditional camera encoder, MoE logic in wan_video_dit_moe.py
             block.cam_encoder = nn.Linear(13, dim)
             block.projector = nn.Linear(dim, dim)
             block.cam_encoder.weight.data.zero_()
@@ -903,15 +923,17 @@ class MultiDatasetLightningModelForTrain(pl.LightningModule):
         
         if resume_ckpt_path is not None:
             state_dict = torch.load(resume_ckpt_path, map_location="cpu")
+            state_dict.pop("global_router.weight", None)
+            state_dict.pop("global_router.bias", None)
             self.pipe.dit.load_state_dict(state_dict, strict=False)
             print('load checkpoint:', resume_ckpt_path)
 
         self.freeze_parameters()
         
-        # 🔧 训练参数设置
+        # 🔧 Training parameter setup
         for name, module in self.pipe.denoising_model().named_modules():
-            if any(keyword in name for keyword in ["projector", "self_attn", "clean_x_embedder",
-                                                "moe", "sekai_processor"]):
+            if any(keyword in name for keyword in ["cam_encoder", "projector", "self_attn", "clean_x_embedder", 
+                                                "moe", "sekai_processor", "nuscenes_processor","openx_processor"]):
                 for param in module.parameters():
                     param.requires_grad = True
         
@@ -919,45 +941,42 @@ class MultiDatasetLightningModelForTrain(pl.LightningModule):
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.use_gradient_checkpointing_offload = use_gradient_checkpointing_offload
         
-        # 创建可视化目录
+        # Create visualization directory
         self.vis_dir = "multi_dataset_dynamic/visualizations"
         os.makedirs(self.vis_dir, exist_ok=True)
 
     def add_moe_components(self):
-        """🔧 添加MoE相关组件 - 类似add_framepack_components的方式"""
+        """🔧 Add MoE related components - Simplified, only add MoE to each block, global processor in WanModelMoe"""
         if not hasattr(self.pipe.dit, 'moe_config'):
             self.pipe.dit.moe_config = self.moe_config
-            print("✅ 添加了MoE配置到模型")
+            print("✅ Added MoE configuration to the model")
+        self.pipe.dit.top_k = self.moe_config.get("top_k", 1)
         
-        # 为每个block动态添加MoE组件
+        # Add MoE components to each block (modality processors are created globally in WanModelMoe)
         dim = self.pipe.dit.blocks[0].self_attn.q.weight.shape[0]
         unified_dim = self.moe_config.get("unified_dim", 30)
-        
-        for i, block in enumerate(self.pipe.dit.blocks):
-            from diffsynth.models.wan_video_dit_moe import ModalityProcessor, MultiModalMoE
-            
-            # Sekai模态处理器 - 输出unified_dim
-            block.sekai_processor = ModalityProcessor("sekai", 13, unified_dim)
-            
-            # NuScenes模态处理器 - 输出unified_dim
-            # block.nuscenes_processor = ModalityProcessor("nuscenes", 8, unified_dim)
+        num_experts = self.moe_config.get("num_experts", 4)
+        from diffsynth.models.wan_video_dit_moe import MultiModalMoE, ModalityProcessor
 
-            # block.openx_processor = ModalityProcessor("openx", 13, unified_dim)  # OpenX使用13维输入，类似sekai但独立处理
+        self.pipe.dit.sekai_processor = ModalityProcessor("sekai", 13, unified_dim)
+        self.pipe.dit.nuscenes_processor = ModalityProcessor("nuscenes", 8, unified_dim)
+        self.pipe.dit.openx_processor = ModalityProcessor("openx", 13, unified_dim)  # OpenX uses 13D input, similar to sekai but processed independently
+        self.pipe.dit.global_router = nn.Linear(unified_dim, num_experts)
 
-            
-            # MoE网络 - 输入unified_dim，输出dim
+        for i, block in enumerate(self.pipe.dit.blocks):            
+            # Only add MoE network to each block
             block.moe = MultiModalMoE(
                 unified_dim=unified_dim,
-                output_dim=dim,  # 输出维度匹配transformer block的dim
+                output_dim=dim,
                 num_experts=self.moe_config.get("num_experts", 4),
                 top_k=self.moe_config.get("top_k", 2)
             )
             
-            print(f"✅ Block {i} 添加了MoE组件 (unified_dim: {unified_dim}, experts: {self.moe_config.get('num_experts', 4)})")
+            print(f"✅ Block {i} added MoE component (unified_dim: {unified_dim}, experts: {self.moe_config.get('num_experts', 4)})")
 
 
     def add_framepack_components(self):
-        """🔧 添加FramePack相关组件"""
+        """🔧 Add FramePack related components"""
         if not hasattr(self.pipe.dit, 'clean_x_embedder'):
             inner_dim = self.pipe.dit.blocks[0].self_attn.q.weight.shape[0]
             
@@ -979,7 +998,7 @@ class MultiDatasetLightningModelForTrain(pl.LightningModule):
                         raise ValueError(f"Unsupported scale: {scale}")
             
             self.pipe.dit.clean_x_embedder = CleanXEmbedder(inner_dim)
-            print("✅ 添加了FramePack的clean_x_embedder组件")
+            print("✅ Added FramePack's clean_x_embedder component")
         
     def freeze_parameters(self):
         self.pipe.requires_grad_(False)
@@ -987,7 +1006,7 @@ class MultiDatasetLightningModelForTrain(pl.LightningModule):
         self.pipe.denoising_model().train()
 
     def training_step(self, batch, batch_idx):
-        """🔧 多数据集训练步骤"""
+        """🔧 Multi-Dataset Training Step"""
         condition_frames = batch["condition_frames"][0].item()
         target_frames = batch["target_frames"][0].item()
         
@@ -998,7 +1017,7 @@ class MultiDatasetLightningModelForTrain(pl.LightningModule):
         dataset_type = batch.get("dataset_type", ["sekai"])[0]
         scene_name = batch.get("scene_name", ["unknown"])[0]
         
-        # 准备输入数据
+        # Prepare input data
         latents = batch["latents"].to(self.device)
         if len(latents.shape) == 4:
             latents = latents.unsqueeze(0)
@@ -1015,34 +1034,34 @@ class MultiDatasetLightningModelForTrain(pl.LightningModule):
         if clean_latents_4x is not None and len(clean_latents_4x.shape) == 4:
             clean_latents_4x = clean_latents_4x.unsqueeze(0)
         
-        # 索引处理
+        # Index handling
         latent_indices = batch["latent_indices"].to(self.device)
         clean_latent_indices = batch["clean_latent_indices"].to(self.device) if batch["clean_latent_indices"].numel() > 0 else None
         clean_latent_2x_indices = batch["clean_latent_2x_indices"].to(self.device) if batch["clean_latent_2x_indices"].numel() > 0 else None
         clean_latent_4x_indices = batch["clean_latent_4x_indices"].to(self.device) if batch["clean_latent_4x_indices"].numel() > 0 else None
         
-        # Camera embedding处理
+        # Camera embedding handling
         cam_emb = batch["camera"].to(self.device)
         
-        # 🔧 根据数据集类型设置modality_inputs
+        # 🔧 Set modality_inputs based on dataset type
         if dataset_type == "sekai":
             modality_inputs = {"sekai": cam_emb}
-        elif dataset_type == "spatialvid":  # 🔧 spatialvid使用sekai processor
-            modality_inputs = {"sekai": cam_emb}  # 注意：这里使用"sekai"键
+        elif dataset_type == "spatialvid":  # 🔧 spatialvid uses sekai processor
+            modality_inputs = {"sekai": cam_emb}  # Note: uses "sekai" key here
         elif dataset_type == "nuscenes":
             modality_inputs = {"nuscenes": cam_emb}
-        elif dataset_type == "openx":  # 🔧 新增：openx使用独立的processor
+        elif dataset_type == "openx":  # 🔧 New: openx uses a dedicated processor
             modality_inputs = {"openx": cam_emb}
         else:
-            modality_inputs = {"sekai": cam_emb}  # 默认
+            modality_inputs = {"sekai": cam_emb}  # Default
         
         camera_dropout_prob = 0.05
         if random.random() < camera_dropout_prob:
             cam_emb = torch.zeros_like(cam_emb)
-            # 同时清空modality_inputs
+            # Also clear modality_inputs
             for key in modality_inputs:
                 modality_inputs[key] = torch.zeros_like(modality_inputs[key])
-            print(f"应用camera dropout for CFG training (dataset: {dataset_name}, type: {dataset_type})")
+            print(f"Applying camera dropout for CFG training (dataset: {dataset_name}, type: {dataset_type})")
         
         prompt_emb = batch["prompt_emb"]
         prompt_emb["context"] = prompt_emb["context"][0].to(self.device)
@@ -1053,13 +1072,13 @@ class MultiDatasetLightningModelForTrain(pl.LightningModule):
         if "y" in image_emb:
             image_emb["y"] = image_emb["y"][0].to(self.device)
 
-        # Loss计算
+        # Loss calculation
         self.pipe.device = self.device
         noise = torch.randn_like(latents)
         timestep_id = torch.randint(0, self.pipe.scheduler.num_train_timesteps, (1,))
         timestep = self.pipe.scheduler.timesteps[timestep_id].to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
         
-        # FramePack风格的噪声处理
+        # FramePack style noise handling
         noisy_condition_latents = None
         if clean_latents is not None:
             noisy_condition_latents = copy.deepcopy(clean_latents)
@@ -1076,12 +1095,11 @@ class MultiDatasetLightningModelForTrain(pl.LightningModule):
         
         training_target = self.pipe.scheduler.training_target(latents, noise, timestep)
         
-        # 🔧 Forward调用 - 传递modality_inputs
-        noise_pred, moe_loss = self.pipe.denoising_model()(
+        noise_pred, specialization_loss = self.pipe.denoising_model()(
             noisy_latents, 
             timestep=timestep, 
             cam_emb=cam_emb,
-            modality_inputs=modality_inputs,  # 🔧 传递多模态输入
+            modality_inputs=modality_inputs,  # 🔧 Pass multi-modal inputs
             latent_indices=latent_indices,
             clean_latents=noisy_condition_latents if noisy_condition_latents is not None else clean_latents,
             clean_latent_indices=clean_latent_indices,
@@ -1096,13 +1114,31 @@ class MultiDatasetLightningModelForTrain(pl.LightningModule):
             use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload
         )
         
-        # 计算loss
-        loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
-        loss = loss * self.pipe.scheduler.training_weight(timestep)
+        # Calculate loss
+        # 🔧 Calculate total loss = Reconstruction loss + MoE specialization loss
+        reconstruction_loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
+        reconstruction_loss = reconstruction_loss * self.pipe.scheduler.training_weight(timestep)
         
-        print(f'--------loss ({dataset_name}-{dataset_type})------------:', loss)
+        # 🔧 Add MoE specialization loss (Cross-Entropy loss)
+        specialization_loss_weight = self.moe_config.get("moe_loss_weight", 0.1)
+        total_loss = reconstruction_loss + specialization_loss_weight * specialization_loss
+        
+        print(f'\n loss info (step {self.global_step}):')
+        print(f'  - diff loss: {reconstruction_loss.item():.6f}')
+        print(f'  - MoE specification loss: {specialization_loss.item():.6f}')
+        print(f'  - Expert loss weight: {specialization_loss_weight}')
+        print(f'  - Total Loss: {total_loss.item():.6f}')
+        
+        # 🔧 Display expected expert mapping
+        modality_to_expert = {
+            "sekai": 0,
+            "nuscenes": 1, 
+            "openx": 2
+        }
+        expected_expert = modality_to_expert.get(dataset_type, 0)
+        print(f'  - current modality: {dataset_type} -> expected expert: {expected_expert}')
 
-        return loss
+        return total_loss
 
     def configure_optimizers(self):
         trainable_modules = filter(lambda p: p.requires_grad, self.pipe.denoising_model().parameters())
@@ -1110,36 +1146,36 @@ class MultiDatasetLightningModelForTrain(pl.LightningModule):
         return optimizer
     
     def on_save_checkpoint(self, checkpoint):
-        checkpoint_dir = "/share_zhuyixuan05/zhuyixuan05/ICLR2026/framepack_moe_spatialvid"
+        checkpoint_dir = "/mnt/data/louis_crq/astra2/playground/checkpoints"
         os.makedirs(checkpoint_dir, exist_ok=True)
         
         current_step = self.global_step
         checkpoint.clear()
         
         state_dict = self.pipe.denoising_model().state_dict()
-        torch.save(state_dict, os.path.join(checkpoint_dir, f"step{current_step}.ckpt"))
-        print(f"Saved MoE model checkpoint: step{current_step}.ckpt")
+        torch.save(state_dict, os.path.join(checkpoint_dir, f"step{current_step}_origin_other_continue3.ckpt"))
+        print(f"Saved MoE model checkpoint: step{current_step}_origin.ckpt")
 
 def train_multi_dataset(args):
-    """训练支持多数据集MoE的模型"""
+    """Train Multi-Dataset MoE Model"""
     
-    # 🔧 数据集配置
+    # 🔧 Dataset configuration
     dataset_configs = [
         # {
         #     'name': 'sekai-drone',
         #     'paths': ['/share_zhuyixuan05/zhuyixuan05/sekai-game-drone'],
         #     'type': 'sekai',
-        #     'weight': 1.0
+        #     'weight': 0.7
         # },
         # {
         #     'name': 'sekai-walking',
         #     'paths': ['/share_zhuyixuan05/zhuyixuan05/sekai-game-walking'],
         #     'type': 'sekai',
-        #     'weight': 1.0
+        #     'weight': 0.7
         # },
         {
             'name': 'spatialvid',
-            'paths': ['/share_zhuyixuan05/zhuyixuan05/spatialvid'],
+            'manifest': ["/mnt/data/louis_crq/preprocessed_data/SpatialVID_Wan2/manifest.json"],
             'type': 'spatialvid',
             'weight': 1.0
         },
@@ -1147,13 +1183,13 @@ def train_multi_dataset(args):
         #     'name': 'nuscenes',
         #     'paths': ['/share_zhuyixuan05/zhuyixuan05/nuscenes_video_generation_dynamic'],
         #     'type': 'nuscenes',
-        #     'weight': 4.0
+        #     'weight': 7.0
         # },
         # {
         #     'name': 'openx-fractal',
         #     'paths': ['/share_zhuyixuan05/zhuyixuan05/openx-fractal-encoded'],
         #     'type': 'openx',
-        #     'weight': 1.0
+        #     'weight': 1.1
         # }
     ]
     
@@ -1172,9 +1208,9 @@ def train_multi_dataset(args):
         num_workers=args.dataloader_num_workers
     )
     
-    # 🔧 MoE配置
+    # 🔧 MoE configuration
     moe_config = {
-        "unified_dim": args.unified_dim,  # 新增
+        "unified_dim": args.unified_dim,  # New
         "num_experts": args.moe_num_experts,
         "top_k": args.moe_top_k,
         "moe_loss_weight": args.moe_loss_weight,
@@ -1189,7 +1225,7 @@ def train_multi_dataset(args):
         use_gradient_checkpointing=args.use_gradient_checkpointing,
         use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
         resume_ckpt_path=args.resume_ckpt_path,
-        use_moe=True,  # 总是使用MoE
+        use_moe=True,  # Always use MoE
         moe_config=moe_config
     )
 
@@ -1208,40 +1244,40 @@ def train_multi_dataset(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train Multi-Dataset FramePack with MoE")
-    parser.add_argument("--dit_path", type=str, default="models/Wan-AI/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors")
+    parser.add_argument("--dit_path", type=str, default="/mnt/data/louis_crq/models/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors")
     parser.add_argument("--output_path", type=str, default="./")
     parser.add_argument("--learning_rate", type=float, default=1e-5)
-    parser.add_argument("--steps_per_epoch", type=int, default=2000)
+    parser.add_argument("--steps_per_epoch", type=int, default=20000)
     parser.add_argument("--max_epochs", type=int, default=100000)
-    parser.add_argument("--min_condition_frames", type=int, default=8, help="最小条件帧数")
-    parser.add_argument("--max_condition_frames", type=int, default=120, help="最大条件帧数")
-    parser.add_argument("--target_frames", type=int, default=32, help="目标帧数")
+    parser.add_argument("--min_condition_frames", type=int, default=8, help="Minimum number of condition frames")
+    parser.add_argument("--max_condition_frames", type=int, default=120, help="Maximum number of condition frames")
+    parser.add_argument("--target_frames", type=int, default=32, help="Target number of frames")
     parser.add_argument("--dataloader_num_workers", type=int, default=4)
     parser.add_argument("--accumulate_grad_batches", type=int, default=1)
-    parser.add_argument("--training_strategy", type=str, default="deepspeed_stage_1")
+    parser.add_argument("--training_strategy", type=str, default="ddp_find_unused_parameters_true")
     parser.add_argument("--use_gradient_checkpointing", default=False)
     parser.add_argument("--use_gradient_checkpointing_offload", action="store_true")
-    parser.add_argument("--resume_ckpt_path", type=str, default="/share_zhuyixuan05/zhuyixuan05/ICLR2026/sekai/sekai_walking_framepack/step1000_framepack.ckpt")
+    parser.add_argument("--resume_ckpt_path", type=str, default="/share_zhuyixuan05/zhuyixuan05/ICLR2026/framepack_moe/step23000_origin_other_continue_con.ckpt")
     
-    # 🔧 MoE参数
-    parser.add_argument("--unified_dim", type=int, default=25, help="统一的中间维度")
-    parser.add_argument("--moe_num_experts", type=int, default=1, help="专家数量")
-    parser.add_argument("--moe_top_k", type=int, default=1, help="Top-K专家")
-    parser.add_argument("--moe_loss_weight", type=float, default=0.00, help="MoE损失权重")
+    # 🔧 MoE parameters
+    parser.add_argument("--unified_dim", type=int, default=25, help="Unified intermediate dimension")
+    parser.add_argument("--moe_num_experts", type=int, default=3, help="Number of experts")
+    parser.add_argument("--moe_top_k", type=int, default=1, help="Top-K experts")
+    parser.add_argument("--moe_loss_weight", type=float, default=0.1, help="MoE loss weight")
     
     args = parser.parse_args()
     
-    print("🔧 多数据集MoE训练配置:")
-    print(f"  - 使用wan_video_dit_moe.py作为模型")
-    print(f"  - 统一维度: {args.unified_dim}")
-    print(f"  - 专家数量: {args.moe_num_experts}")
+    print("🔧 Multi-Dataset MoE Training Configuration:")
+    print(f"  - Using wan_video_dit_moe.py as model")
+    print(f"  - Unified Dimension: {args.unified_dim}")
+    print(f"  - Number of Experts: {args.moe_num_experts}")
     print(f"  - Top-K: {args.moe_top_k}")
-    print(f"  - MoE损失权重: {args.moe_loss_weight}")
-    print("  - 数据集:")
-    print("    - sekai-game-drone (sekai模态)")
-    print("    - sekai-game-walking (sekai模态)")
-    print("    - spatialvid (使用sekai模态处理器)") 
-    print("    - openx-fractal (使用sekai模态处理器)")
-    print(f"   - nuscenes (nuscenes模态)")
+    print(f"  - MoE Loss Weight: {args.moe_loss_weight}")
+    print("  - Datasets:")
+    print("    - sekai-game-drone (sekai modality)")
+    print("    - sekai-game-walking (sekai modality)")
+    print("    - spatialvid (uses sekai modality processor)") 
+    print("    - openx-fractal (uses sekai modality processor)")
+    print(f"   - nuscenes (nuscenes modality)")
     
     train_multi_dataset(args)
