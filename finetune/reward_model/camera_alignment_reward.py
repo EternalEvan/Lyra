@@ -16,7 +16,7 @@ class CameraAlignmentReward:
     更新版：使用四元数计算旋转误差，并使用 Procrustes 分析对齐轨迹尺度。
     """
 
-    def __init__(self, model_name="facebook/VGGT-1B", cache_dir="/mnt/data/louis_crq/vggt/pretrained", rank=None, device=None):
+    def __init__(self, model_name="facebook/VGGT-1B", cache_dir="/data1/zyx/vggt", rank=None, device=None):
         """
         初始化模型和设备。
 
@@ -227,8 +227,6 @@ if __name__ == '__main__':
                         nargs='+',
                         type=str, required=True,
                         help='Path to the input video files.')
-    parser.add_argument('--output_path', type=str, required=False, default="./camera_alignment_reward_output.txt",
-                        help='Path to the output text file to save reward results.')
     args = parser.parse_args()
     
     file_list = args.video_paths
@@ -236,18 +234,17 @@ if __name__ == '__main__':
     reward_calculator = CameraAlignmentReward()
 
     # 创建模拟的地面真实 (GT) 外参数据
-    num_frames = 32
+    num_frames = 24
     gt_extrinsics_list = []
     current_pose = np.eye(4)
     
     distance = 0.05  # 每帧沿z轴平移0.1个单位
     #gt_extrinsics_list.append(current_pose.copy())
     for i in range(num_frames):
-        # 之字形运动模式
-        if (i // 12) % 2 == 0:
-            yaw_per_frame = 0.05
-        else:
-            yaw_per_frame = -0.1
+        # 左前方运动
+        yaw_per_frame = 0.05
+        forward = 0.1
+        
         pose = np.eye(4, dtype=np.float32)
         
         # 旋转矩阵（绕Y轴转向）
@@ -257,6 +254,7 @@ if __name__ == '__main__':
         pose[0, 2] = sin_yaw
         pose[2, 0] = -sin_yaw
         pose[2, 2] = cos_yaw
+        pose[2, 3] = -forward
         
         transform = torch.as_tensor(pose)
         current_pose = current_pose @ transform.numpy()
@@ -291,27 +289,15 @@ if __name__ == '__main__':
                 # print(video_tensor.shape)
                 reward_info = reward_calculator.calculate_reward(video_tensor, mock_gt_extrinsics)
 
-                with open(args.output_path, "a", encoding="utf-8") as f:
-                    f.write("--- 对齐奖励结果 ---\n")
-                    f.write(f"平均旋转误差: {reward_info['mean_rotation_error_degrees']:.2f} 度\n")
-                    f.write(f"平均平移误差 (尺度对齐后): {reward_info['mean_translation_error']:.4f}\n")
-                    f.write(f"计算出的轨迹尺度因子: {reward_info['translation_scale_factor']:.4f}\n")
-                    f.write("-" * 20 + "\n")
-                    f.write(f"旋转奖励: {reward_info['rotation_reward']:.4f}\n")
-                    f.write(f"平移奖励: {reward_info['translation_reward']:.4f}\n")
-                    f.write(f"最终加权总奖励: {reward_info['total_reward']:.4f}\n")
-                    f.write("----------------------\n")
-                    f.write("\n")
-
-                # print("\n--- 对齐奖励结果 ---")
-                # print(f"平均旋转误差: {reward_info['mean_rotation_error_degrees']:.2f} 度")
-                # print(f"平均平移误差 (尺度对齐后): {reward_info['mean_translation_error']:.4f}")
-                # print(f"计算出的轨迹尺度因子: {reward_info['translation_scale_factor']:.4f}")
-                # print("-" * 20)
-                # print(f"旋转奖励: {reward_info['rotation_reward']:.4f}")
-                # print(f"平移奖励: {reward_info['translation_reward']:.4f}")
-                # print(f"最终加权总奖励: {reward_info['total_reward']:.4f}")
-                # print("----------------------\n")
+                print("\n--- 对齐奖励结果 ---")
+                print(f"平均旋转误差: {reward_info['mean_rotation_error_degrees']:.2f} 度")
+                print(f"平均平移误差 (尺度对齐后): {reward_info['mean_translation_error']:.4f}")
+                print(f"计算出的轨迹尺度因子: {reward_info['translation_scale_factor']:.4f}")
+                print("-" * 20)
+                print(f"旋转奖励: {reward_info['rotation_reward']:.4f}")
+                print(f"平移奖励: {reward_info['translation_reward']:.4f}")
+                print(f"最终加权总奖励: {reward_info['total_reward']:.4f}")
+                print("----------------------\n")
 
             except Exception as e:
                 import traceback

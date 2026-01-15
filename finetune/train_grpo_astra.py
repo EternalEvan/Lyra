@@ -54,7 +54,7 @@ from diffsynth.models.wan_video_dit_moe import WanModelMoe, DiTBlockWithMoE
 from diffsynth.models.wan_video_vae import WanVideoVAE
 from diffsynth.configs.model_config import model_loader_configs
 
-from dataset.spatialvid_datasets import SpatialVidFramePackDataset, framepack_collate_fn
+from fastvideo.dataset.spatialvid_datasets import SpatialVidFramePackDataset, framepack_collate_fn
 from reward_model.camera_alignment_reward import CameraAlignmentReward
 
 from get_target_pose_qwj import extract_target_poses_to_txt
