@@ -162,35 +162,32 @@ class CameraTrajectory:
         poses = []
         current_stage_idx = 0
         frames_in_current_stage = 0
+        stage_frames, stage_func = self.stages[current_stage_idx]
         
         for i in range(total_frames):
-            # 条件帧使用零运动
             if i < condition_frames:
+                # 条件帧使用零运动
                 poses.append(CameraMotionBuilder.zero_motion())
-            else:
-                # 检查是否需要进入下一阶段
-                gen_frame_idx = i - condition_frames
-                
-                # 累积计算当前阶段
-                while current_stage_idx < len(self.stages):
-                    stage_frames, stage_func = self.stages[current_stage_idx]
-                    if frames_in_current_stage < stage_frames:
-                        # 仍在当前阶段
+            elif current_stage_idx < len(self.stages):
+                if frames_in_current_stage < stage_frames:
+                    # 仍在当前阶段
+                    poses.append(stage_func())
+                    frames_in_current_stage += 1
+                else:
+                    # 进入下一阶段
+                    frames_in_current_stage = 0
+                    current_stage_idx += 1
+                    
+                    if current_stage_idx < len(self.stages):
+                        stage_frames, stage_func = self.stages[current_stage_idx]
                         poses.append(stage_func())
                         frames_in_current_stage += 1
-                        break
                     else:
-                        # 进入下一阶段
-                        frames_in_current_stage = 0
-                        current_stage_idx += 1
-                        if current_stage_idx < len(self.stages):
-                            # 使用新阶段的运动函数
-                            poses.append(stage_func())
-                            frames_in_current_stage += 1
-                            break
-                        else:
-                            # 所有阶段都结束了，使用静止
-                            poses.append(CameraMotionBuilder.zero_motion())
-                            break
+                        # 补充本次迭代缺少的零运动
+                        poses.append(CameraMotionBuilder.zero_motion())
+                        
+            else:
+                # 多余帧使用零运动
+                poses.append(CameraMotionBuilder.zero_motion())
         
         return poses

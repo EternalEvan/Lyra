@@ -312,12 +312,12 @@ class DiTBlockWithCam(nn.Module):
         )
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         
-        self.moe = SekaiModal(
-            unified_dim=25,
-            output_dim=dim,
-            num_experts=4,
-            top_k=2
-        )
+        # self.moe = SekaiModal(
+        #     unified_dim=25,
+        #     output_dim=dim,
+        #     num_experts=4,
+        #     top_k=2
+        # )
 
     def forward(self, x, context, cam_emb, t_mod, freqs,
                 expert_weights: Optional[torch.Tensor] = None,

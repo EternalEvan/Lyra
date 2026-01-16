@@ -18,7 +18,7 @@ from einops import rearrange
 
 from scipy.spatial.transform import Rotation as R
 from add_icons import overlay_controls
-from scripts.cond_preprocess import (
+from cond_preprocess import (
     InlineVideoEncoder, image_to_frame_stack, 
     CameraMotionBuilder, CameraTrajectory
 )
@@ -325,7 +325,7 @@ def generate_sekai_camera_embeddings_sliding(
         
         # 创建对应长度的mask序列
         mask = torch.zeros(max_needed_frames, 1, dtype=torch.float32)
-        condition_end = min(start_frame + initial_condition_frames + 1, max_needed_frames)
+        condition_end = min(start_frame + initial_condition_frames, max_needed_frames)
         mask[start_frame:condition_end] = 1.0
         
         camera_embedding = torch.cat([pose_embedding, mask], dim=1)
