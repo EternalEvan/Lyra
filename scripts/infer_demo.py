@@ -485,13 +485,13 @@ def inference_framepack_sliding_window(
     # 3. Add FramePack components
     add_framepack_components(pipe.dit)
     
-    # 4. Add sekai camera embedder dtype compatibility
+    # 4. Modifiy the DiT module (add sekai experts for camera control)
     sekai_config = {
         "num_experts": num_experts,
         "top_k": top_k,
     }
     from diffsynth.models.wan_video_dit_cam import ModalityProcessor, SekaiModal
-    pipe.dit.sekai_processor = ModalityProcessor("sekai", 13, 25).to(device)
+    pipe.dit.sekai_processor = ModalityProcessor("sekai", 13, 25).to(device) # project the input dim to unified dim
     
     for i, block in enumerate(pipe.dit.blocks):
         block.moe = SekaiModal(

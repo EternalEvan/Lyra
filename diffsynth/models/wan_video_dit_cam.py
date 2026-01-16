@@ -259,7 +259,7 @@ class SekaiModal(nn.Module):
         original_dtype = x.dtype
         x = x.to(self.experts[0][0].weight.dtype)
         
-        # Expert processing (使用当前层的独立experts)
+        # Expert processing
         expert_outputs = []
         for expert in self.experts:
             expert_output = expert(x)  # [batch, seq, output_dim]
