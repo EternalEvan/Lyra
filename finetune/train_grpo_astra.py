@@ -813,7 +813,7 @@ def sample_reference_model(
             print(f"在导出视频时发生错误；{e}")
             
         target_pose_output_path = f"{args.experiment_dir}/target_poses/wan_2_1_step_{train_step+1}_rank_{rank}_{index}.txt"
-        extract_target_poses_to_txt(conditioning["cam_emb"].squeeze(0), target_pose_output_path)
+        # extract_target_poses_to_txt(conditioning["cam_emb"].squeeze(0), target_pose_output_path)
         prompt_output_path = f"{args.experiment_dir}/prompts/wan_2_1_step_{train_step+1}_rank_{rank}_{index}.txt"
         with open(prompt_output_path, "w", encoding="utf-8") as f:
             f.write(prompt_text)

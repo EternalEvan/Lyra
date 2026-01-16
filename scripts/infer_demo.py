@@ -14,75 +14,60 @@ import imageio
 import json
 from diffsynth import WanVideoAstraPipeline, ModelManager
 import argparse
-from torchvision.transforms import v2
 from einops import rearrange
+
 from scipy.spatial.transform import Rotation as R
 from add_icons import overlay_controls
+from scripts.cond_preprocess import (
+    InlineVideoEncoder, image_to_frame_stack, 
+    CameraMotionBuilder, CameraTrajectory
+)
 
-VALID_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
-class InlineVideoEncoder:
-
-    def __init__(self, pipe: WanVideoAstraPipeline, device="cuda"):
-        self.device = getattr(pipe, "device", device)
-        self.tiler_kwargs = {"tiled": True, "tile_size": (34, 34), "tile_stride": (18, 16)}
-        self.frame_process = v2.Compose([
-            v2.ToTensor(),
-            v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        ])
-
-        self.pipe = pipe
-
-    @staticmethod
-    def _crop_and_resize(image: Image.Image) -> Image.Image:
-        target_w, target_h = 832, 480
-        return v2.functional.resize(
-            image,
-            (round(target_h), round(target_w)),
-            interpolation=v2.InterpolationMode.BILINEAR,
-        )
-
-    def preprocess_frame(self, image: Image.Image) -> torch.Tensor:
-        image = image.convert("RGB")
-        image = self._crop_and_resize(image)
-        return self.frame_process(image)
-
-    def load_video_frames(self, video_path: Path) -> Optional[torch.Tensor]:
-        reader = imageio.get_reader(str(video_path))
-        frames = []
-        for frame_data in reader:
-            frame = Image.fromarray(frame_data)
-            frames.append(self.preprocess_frame(frame))
-        reader.close()
-
-        if not frames:
-            return None
-
-        frames = torch.stack(frames, dim=0)
-        return rearrange(frames, "T C H W -> C T H W")
-
-    def encode_frames_to_latents(self, frames: torch.Tensor) -> torch.Tensor:
-        frames = frames.unsqueeze(0).to(self.device, dtype=torch.bfloat16)
-        with torch.no_grad():
-            latents = self.pipe.encode_video(frames, **self.tiler_kwargs)[0]
-
-        if latents.dim() == 5 and latents.shape[0] == 1:
-            latents = latents.squeeze(0)
-        return latents.cpu()
+# 预定义的相机轨迹库
+TRAJECTORY_LIBRARY = {
+    1: CameraTrajectory("forward")
+        .add_stage(24, lambda: CameraMotionBuilder.forward(0.03)),
     
-def image_to_frame_stack(
-    image_path: Path, 
-    encoder: InlineVideoEncoder, 
-    repeat_count: int = 10
-) -> torch.Tensor:
-    """Repeat a single image into a tensor with specified number of frames, shape [C, T, H, W]"""
-    if image_path.suffix.lower() not in VALID_IMAGE_EXTENSIONS:
-        raise ValueError(f"Unsupported image format: {image_path.suffix}")
+    2: CameraTrajectory("left_turn")
+        .add_stage(24, lambda: CameraMotionBuilder.rotate_left(0.03, 0.00)),
+    
+    3: CameraTrajectory("right_turn")
+        .add_stage(24, lambda: CameraMotionBuilder.rotate_right(0.03, 0.00)),
+    
+    4: CameraTrajectory("forward_left")
+        .add_stage(24, lambda: CameraMotionBuilder.rotate_left(0.03, 0.03)),
+    
+    5: CameraTrajectory("forward_right")
+        .add_stage(24, lambda: CameraMotionBuilder.rotate_right(0.03, 0.03)),
+    
+    6: CameraTrajectory("s_curve")
+        .add_stage(12, lambda: CameraMotionBuilder.rotate_left(0.03, 0.03))
+        .add_stage(12, lambda: CameraMotionBuilder.rotate_right(0.03, 0.03)),
+    
+    7: CameraTrajectory("left_right")
+        .add_stage(12, lambda: CameraMotionBuilder.rotate_left(0.03, 0.00))
+        .add_stage(12, lambda: CameraMotionBuilder.rotate_right(0.03, 0.00)),
+}
 
-    image = Image.open(str(image_path))
-    frame = encoder.preprocess_frame(image)
-    frames = torch.stack([frame for _ in range(repeat_count)], dim=0)
-    return rearrange(frames, "T C H W -> C T H W")
 
+def load_encoded_video_from_pth(pth_path, start_frame=0, num_frames=10):
+    """Load pre-encoded video data from pth file"""
+    print(f"Loading encoded video from {pth_path}")
+    
+    encoded_data = torch.load(pth_path, weights_only=False, map_location="cpu")
+    full_latents = encoded_data['latents']  # [C, T, H, W]
+    
+    print(f"Full latents shape: {full_latents.shape}")
+    print(f"Extracting frames {start_frame} to {start_frame + num_frames}")
+    
+    if start_frame + num_frames > full_latents.shape[1]:
+        raise ValueError(f"Not enough frames: requested {start_frame + num_frames}, available {full_latents.shape[1]}")
+    
+    condition_latents = full_latents[:, start_frame:start_frame + num_frames, :, :]
+    
+    print(f"✅ Extracted condition latents shape: {condition_latents.shape}")
+    
+    return condition_latents, encoded_data
 
 def load_or_encode_condition(
     condition_pth_path: Optional[str],
@@ -125,7 +110,6 @@ def load_or_encode_condition(
     return condition_latents, encoded_data
 
 
-
 def compute_relative_pose_matrix(pose1, pose2):
     """
     Compute relative pose between two consecutive frames, return 3x4 camera matrix [R_rel | t_rel]
@@ -159,25 +143,6 @@ def compute_relative_pose_matrix(pose1, pose2):
     relative_matrix = np.hstack([R_rel, t_rel.reshape(3, 1)])
     
     return relative_matrix
-
-def load_encoded_video_from_pth(pth_path, start_frame=0, num_frames=10):
-    """Load pre-encoded video data from pth file"""
-    print(f"Loading encoded video from {pth_path}")
-    
-    encoded_data = torch.load(pth_path, weights_only=False, map_location="cpu")
-    full_latents = encoded_data['latents']  # [C, T, H, W]
-    
-    print(f"Full latents shape: {full_latents.shape}")
-    print(f"Extracting frames {start_frame} to {start_frame + num_frames}")
-    
-    if start_frame + num_frames > full_latents.shape[1]:
-        raise ValueError(f"Not enough frames: requested {start_frame + num_frames}, available {full_latents.shape[1]}")
-    
-    condition_latents = full_latents[:, start_frame:start_frame + num_frames, :, :]
-    
-    print(f"✅ Extracted condition latents shape: {condition_latents.shape}")
-    
-    return condition_latents, encoded_data
 
 def compute_relative_pose(pose_a, pose_b, use_torch=False):
     """Compute relative pose matrix of camera B with respect to camera A"""
@@ -333,7 +298,7 @@ def generate_sekai_camera_embeddings_sliding(
         return camera_embedding.to(torch.bfloat16)
         
     else:
-        # Ensure generating a sufficiently long camera sequence
+        # 确保生成足够长的相机序列
         max_needed_frames = max(
             start_frame + initial_condition_frames + new_frames, 
             framepack_needed_frames, 
@@ -341,277 +306,24 @@ def generate_sekai_camera_embeddings_sliding(
             
         print(f"🔧 Generating Sekai synthetic camera frames: {max_needed_frames}")
         
-        CONDITION_FRAMES = initial_condition_frames
-        STAGE_1 = new_frames//2
-        STAGE_2 = new_frames - STAGE_1
+        # 选择轨迹配置
+        if cam_type in TRAJECTORY_LIBRARY:
+            trajectory = TRAJECTORY_LIBRARY[cam_type]
+            print(f"🔧 Using predefined trajectory: {trajectory.name} (type={cam_type})")
+        else:
+            raise ValueError(f"Undefined camera type: {cam_type}. Available types: {list(TRAJECTORY_LIBRARY.keys())}")
         
-        if cam_type==1:
-            print("--------------- FORWARD MODE ---------------")
-            relative_poses = []
-            for i in range(max_needed_frames):
-                if i < CONDITION_FRAMES:
-                    # Input condition frames default to zero motion camera pose
-                    pose = np.eye(4, dtype=np.float32)
-                elif i < CONDITION_FRAMES+STAGE_1+STAGE_2:
-                    # Forward
-                    forward_speed = 0.03
-
-                    pose = np.eye(4, dtype=np.float32)
-                    pose[2, 3] = -forward_speed
-                else:
-                    # The part beyond condition frames and target frames remains stationary
-                    pose = np.eye(4, dtype=np.float32)
-                
-                relative_pose = pose[:3, :]
-                relative_poses.append(torch.as_tensor(relative_pose))
+        # 生成完整的位姿序列
+        poses = trajectory.generate_poses(max_needed_frames, initial_condition_frames)
         
-        elif cam_type==2:
-            print("--------------- LEFT TURNING MODE ---------------")
-            relative_poses = []
-            for i in range(max_needed_frames):
-                if i < CONDITION_FRAMES:
-                    # Input condition frames default to zero motion camera pose
-                    pose = np.eye(4, dtype=np.float32)
-                elif i < CONDITION_FRAMES+STAGE_1+STAGE_2:
-                    # Left turn
-                    yaw_per_frame = 0.03
-
-                    # Rotation matrix
-                    cos_yaw = np.cos(yaw_per_frame)
-                    sin_yaw = np.sin(yaw_per_frame)
-                    
-                    # Forward
-                    forward_speed = 0.00
-
-                    pose = np.eye(4, dtype=np.float32)
-                    
-                    pose[0, 0] = cos_yaw
-                    pose[0, 2] = sin_yaw
-                    pose[2, 0] = -sin_yaw
-                    pose[2, 2] = cos_yaw
-                    pose[2, 3] = -forward_speed
-                else:
-                    # The part beyond condition frames and target frames remains stationary
-                    pose = np.eye(4, dtype=np.float32)
-                
-                relative_pose = pose[:3, :]
-                relative_poses.append(torch.as_tensor(relative_pose))
+        # 提取相对位姿的3x4部分
+        relative_poses = [pose[:3, :] for pose in poses]
+        relative_poses_tensor = [torch.as_tensor(pose) for pose in relative_poses]
         
-        elif cam_type==3:
-            print("--------------- RIGHT TURNING MODE ---------------")
-            relative_poses = []
-            for i in range(max_needed_frames):
-                if i < CONDITION_FRAMES:
-                    # Input condition frames default to zero motion camera pose
-                    pose = np.eye(4, dtype=np.float32)
-                elif i < CONDITION_FRAMES+STAGE_1+STAGE_2:
-                    # Right turn
-                    yaw_per_frame = -0.03
-
-                    # Rotation matrix
-                    cos_yaw = np.cos(yaw_per_frame)
-                    sin_yaw = np.sin(yaw_per_frame)
-                    
-                    # Forward
-                    forward_speed = 0.00
-
-                    pose = np.eye(4, dtype=np.float32)
-                    
-                    pose[0, 0] = cos_yaw
-                    pose[0, 2] = sin_yaw
-                    pose[2, 0] = -sin_yaw
-                    pose[2, 2] = cos_yaw
-                    pose[2, 3] = -forward_speed
-                else:
-                    # The part beyond condition frames and target frames remains stationary
-                    pose = np.eye(4, dtype=np.float32)
-                
-                relative_pose = pose[:3, :]
-                relative_poses.append(torch.as_tensor(relative_pose))
-        
-        elif cam_type==4:
-            print("--------------- FORWARD LEFT MODE ---------------")
-            relative_poses = []
-            for i in range(max_needed_frames):
-                if i < CONDITION_FRAMES:
-                    # Input condition frames default to zero motion camera pose
-                    pose = np.eye(4, dtype=np.float32)
-                elif i < CONDITION_FRAMES+STAGE_1+STAGE_2:
-                    # Left turn
-                    yaw_per_frame = 0.03
-
-                    # Rotation matrix
-                    cos_yaw = np.cos(yaw_per_frame)
-                    sin_yaw = np.sin(yaw_per_frame)
-                    
-                    # Forward
-                    forward_speed = 0.03
-
-                    pose = np.eye(4, dtype=np.float32)
-                    
-                    pose[0, 0] = cos_yaw
-                    pose[0, 2] = sin_yaw
-                    pose[2, 0] = -sin_yaw
-                    pose[2, 2] = cos_yaw
-                    pose[2, 3] = -forward_speed
-                
-                else:
-                    # The part beyond condition frames and target frames remains stationary
-                    pose = np.eye(4, dtype=np.float32)
-                    
-                relative_pose = pose[:3, :]
-                relative_poses.append(torch.as_tensor(relative_pose))
-        
-        elif cam_type==5:
-            print("--------------- FORWARD RIGHT MODE ---------------")
-            relative_poses = []
-            for i in range(max_needed_frames):
-                if i < CONDITION_FRAMES:
-                    # Input condition frames default to zero motion camera pose
-                    pose = np.eye(4, dtype=np.float32)
-                elif i < CONDITION_FRAMES+STAGE_1+STAGE_2:
-                    # Right turn
-                    yaw_per_frame = -0.03
-
-                    # Rotation matrix
-                    cos_yaw = np.cos(yaw_per_frame)
-                    sin_yaw = np.sin(yaw_per_frame)
-                    
-                    # Forward
-                    forward_speed = 0.03
-
-                    pose = np.eye(4, dtype=np.float32)
-                    
-                    pose[0, 0] = cos_yaw
-                    pose[0, 2] = sin_yaw
-                    pose[2, 0] = -sin_yaw
-                    pose[2, 2] = cos_yaw
-                    pose[2, 3] = -forward_speed
-                
-                else:
-                    # The part beyond condition frames and target frames remains stationary
-                    pose = np.eye(4, dtype=np.float32)
-                    
-                relative_pose = pose[:3, :]
-                relative_poses.append(torch.as_tensor(relative_pose))
-        
-        elif cam_type==6:
-            print("--------------- S CURVE MODE ---------------")
-            relative_poses = []
-            for i in range(max_needed_frames):
-                if i < CONDITION_FRAMES:
-                    # Input condition frames default to zero motion camera pose
-                    pose = np.eye(4, dtype=np.float32)
-                elif i < CONDITION_FRAMES+STAGE_1:
-                    # Left turn
-                    yaw_per_frame = 0.03
-
-                    # Rotation matrix
-                    cos_yaw = np.cos(yaw_per_frame)
-                    sin_yaw = np.sin(yaw_per_frame)
-                    
-                    # Forward
-                    forward_speed = 0.03
-
-                    pose = np.eye(4, dtype=np.float32)
-                    
-                    pose[0, 0] = cos_yaw
-                    pose[0, 2] = sin_yaw
-                    pose[2, 0] = -sin_yaw
-                    pose[2, 2] = cos_yaw
-                    pose[2, 3] = -forward_speed
-                    
-                elif i < CONDITION_FRAMES+STAGE_1+STAGE_2:
-                    # Right turn
-                    yaw_per_frame = -0.03
-
-                    # Rotation matrix
-                    cos_yaw = np.cos(yaw_per_frame)
-                    sin_yaw = np.sin(yaw_per_frame)
-                    
-                    # Forward
-                    forward_speed = 0.03
-                    # Slight left drift to maintain inertia
-                    if i < CONDITION_FRAMES+STAGE_1+STAGE_2//3:
-                        radius_shift = -0.01
-                    else:
-                        radius_shift = 0.00
-
-                    pose = np.eye(4, dtype=np.float32)
-                    
-                    pose[0, 0] = cos_yaw
-                    pose[0, 2] = sin_yaw
-                    pose[2, 0] = -sin_yaw
-                    pose[2, 2] = cos_yaw
-                    pose[2, 3] = -forward_speed
-                    pose[0, 3] = radius_shift
-                    
-                else:
-                    # The part beyond condition frames and target frames remains stationary
-                    pose = np.eye(4, dtype=np.float32)
-                    
-                relative_pose = pose[:3, :]
-                relative_poses.append(torch.as_tensor(relative_pose))
-                    
-        elif cam_type==7:
-            print("--------------- LEFT RIGHT MODE ---------------")
-            relative_poses = []
-            for i in range(max_needed_frames):
-                if i < CONDITION_FRAMES:
-                    # Input condition frames default to zero motion camera pose
-                    pose = np.eye(4, dtype=np.float32)
-                elif i < CONDITION_FRAMES+STAGE_1:
-                    # Left turn
-                    yaw_per_frame = 0.03
-
-                    # Rotation matrix
-                    cos_yaw = np.cos(yaw_per_frame)
-                    sin_yaw = np.sin(yaw_per_frame)
-                    
-                    # Forward
-                    forward_speed = 0.00
-
-                    pose = np.eye(4, dtype=np.float32)
-                    
-                    pose[0, 0] = cos_yaw
-                    pose[0, 2] = sin_yaw
-                    pose[2, 0] = -sin_yaw
-                    pose[2, 2] = cos_yaw
-                    pose[2, 3] = -forward_speed
-                    
-                elif i < CONDITION_FRAMES+STAGE_1+STAGE_2:
-                    # Right turn
-                    yaw_per_frame = -0.03
-
-                    # Rotation matrix
-                    cos_yaw = np.cos(yaw_per_frame)
-                    sin_yaw = np.sin(yaw_per_frame)
-                    
-                    # Forward
-                    forward_speed = 0.00
-
-                    pose = np.eye(4, dtype=np.float32)
-                    
-                    pose[0, 0] = cos_yaw
-                    pose[0, 2] = sin_yaw
-                    pose[2, 0] = -sin_yaw
-                    pose[2, 2] = cos_yaw
-                    pose[2, 3] = -forward_speed
-                
-                else:
-                    # The part beyond condition frames and target frames remains stationary
-                    pose = np.eye(4, dtype=np.float32)
-                    
-                relative_pose = pose[:3, :]
-                relative_poses.append(torch.as_tensor(relative_pose))
-                
-            else:
-                raise ValueError(f"Not Defined Camera Type: {cam_type}")
-            
-        pose_embedding = torch.stack(relative_poses, dim=0)
+        pose_embedding = torch.stack(relative_poses_tensor, dim=0)
         pose_embedding = rearrange(pose_embedding, 'b c d -> b (c d)')
         
-        # Create mask sequence of corresponding length
+        # 创建对应长度的mask序列
         mask = torch.zeros(max_needed_frames, 1, dtype=torch.float32)
         condition_end = min(start_frame + initial_condition_frames + 1, max_needed_frames)
         mask[start_frame:condition_end] = 1.0
