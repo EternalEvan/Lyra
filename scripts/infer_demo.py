@@ -298,7 +298,7 @@ def generate_sekai_camera_embeddings_sliding(
         return camera_embedding.to(torch.bfloat16)
         
     else:
-        # 确保生成足够长的相机序列
+        # make sure to generate enough camera frames
         max_needed_frames = max(
             start_frame + initial_condition_frames + new_frames, 
             framepack_needed_frames, 
@@ -306,24 +306,24 @@ def generate_sekai_camera_embeddings_sliding(
             
         print(f"🔧 Generating Sekai synthetic camera frames: {max_needed_frames}")
         
-        # 选择轨迹配置
+        # choose trajectory config
         if cam_type in TRAJECTORY_LIBRARY:
             trajectory = TRAJECTORY_LIBRARY[cam_type]
             print(f"🔧 Using predefined trajectory: {trajectory.name} (type={cam_type})")
         else:
             raise ValueError(f"Undefined camera type: {cam_type}. Available types: {list(TRAJECTORY_LIBRARY.keys())}")
         
-        # 生成完整的位姿序列
+        # generate full camera pose sequence
         poses = trajectory.generate_poses(max_needed_frames, initial_condition_frames)
         
-        # 提取相对位姿的3x4部分
+        # extract 3x4 matrix to generate 1x13 cam_emb
         relative_poses = [pose[:3, :] for pose in poses]
         relative_poses_tensor = [torch.as_tensor(pose) for pose in relative_poses]
         
         pose_embedding = torch.stack(relative_poses_tensor, dim=0)
         pose_embedding = rearrange(pose_embedding, 'b c d -> b (c d)')
         
-        # 创建对应长度的mask序列
+        # create corresponding masks
         mask = torch.zeros(max_needed_frames, 1, dtype=torch.float32)
         condition_end = min(start_frame + initial_condition_frames, max_needed_frames)
         mask[start_frame:condition_end] = 1.0
