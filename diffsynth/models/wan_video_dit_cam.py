@@ -183,72 +183,56 @@ class CrossAttention(nn.Module):
             y = flash_attention(q, k_img, v_img, num_heads=self.num_heads)
             x = x + y
         return self.o(x)
-
-class ModalityProcessor(nn.Module):
-    """模态处理器 - 将不同模态投影到统一维度"""
     
-    def __init__(self, modality_name: str, input_dim: int, unified_dim: int = 30):
+class Cam_Processor(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        unified_dim: int = 30
+    ):
         super().__init__()
-        self.modality_name = modality_name
         self.input_dim = input_dim
         self.unified_dim = unified_dim
         
+        # 🔧 适配 Astra 中的统一维度
         self.projector = nn.Sequential(
             nn.Linear(input_dim, unified_dim)
         )
         
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [batch_size, seq_len, input_dim] 或 [batch_size, input_dim]
-        Returns:
-            projected: [batch_size, seq_len, unified_dim]
-        """
-        # 🔧 修正：确保输入数据类型匹配
+    def forward(self, x: torch.Tensor):
+        # 🔧 获取原始数据类型
         original_dtype = x.dtype
         
         # 确保有seq_len维度
         if x.dim() == 2:  # [batch, input_dim]
             x = x.unsqueeze(1)  # [batch, 1, input_dim]
-        
-        # 🔧 关键修复：确保数据类型匹配projector的权重类型
+
         x = x.to(self.projector[0].weight.dtype)
-        
         output = self.projector(x)
-        
-        # 🔧 可选：保持原始数据类型
         output = output.to(original_dtype)
         
         return output
     
-class SekaiModal(nn.Module):
-    '''process sekai cam_emb'''
-    
-    def __init__(self, unified_dim: int = 30, hidden_dim: int = 60, output_dim: int = None, 
-                 num_experts: int = 4, top_k: int = 2):
+class Cam_Encoder(nn.Module):
+    def __init__(
+        self, unified_dim: int = 30, 
+        hidden_dim: int = 60, 
+        output_dim: int = None
+    ):
         super().__init__()
         self.unified_dim = unified_dim
-        self.num_experts = num_experts
-        self.top_k = top_k
+        self.hidden_dim = hidden_dim
         self.output_dim = output_dim or unified_dim
         
-        # Experts - 输入unified_dim，输出output_dim (每层独立)
-        self.experts = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(unified_dim, self.output_dim)
-            ) for _ in range(num_experts)
-        ])
+        # 🔧 Astra 中由线性层组成的相机位姿编码器（只保留sekai专家）
+        self.encoder = nn.Sequential(
+            nn.Linear(unified_dim, output_dim)
+        )
         
-    def forward(self, 
-                x: torch.Tensor, 
-                expert_weights: torch.Tensor, 
-                top_k_indices: torch.Tensor, 
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor):
         """
         Args:
             x: [batch_size, seq_len, unified_dim]
-            expert_weights: [batch_size, seq_len, top_k] - 从全局router得到的权重
-            top_k_indices: [batch_size, seq_len, top_k] - 从全局router得到的专家索引
         Returns:
             output: [batch_size, seq_len, output_dim]
         """
@@ -257,37 +241,15 @@ class SekaiModal(nn.Module):
         
         # 🔧 修正：确保数据类型匹配
         original_dtype = x.dtype
-        x = x.to(self.experts[0][0].weight.dtype)
+        x = x.to(self.encoder[0].weight.dtype)
         
-        # Expert processing
-        expert_outputs = []
-        for expert in self.experts:
-            expert_output = expert(x)  # [batch, seq, output_dim]
-            expert_outputs.append(expert_output)
-        
-        expert_outputs = torch.stack(expert_outputs, dim=-2)  # [batch, seq, num_experts, output_dim]
-        
-        # Weighted combination using provided weights and indices
-        output = torch.zeros(batch_size, seq_len, self.output_dim, 
-                           device=x.device, dtype=x.dtype)
-
-        for k in range(self.top_k):
-            expert_idx = top_k_indices[:, :, k]  # [batch, seq]
-            weight = expert_weights[:, :, k:k+1]  # [batch, seq, 1]
-            
-            expert_output = torch.gather(
-                expert_outputs, 
-                dim=2, 
-                index=expert_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, expert_outputs.shape[-1])
-            ).squeeze(2)  # [batch, seq, output_dim]
-            
-            output += weight * expert_output
+        # 🔧 只使用 Astra 中的 sekai 专家
+        output = self.encoder(x) # [batch, seq, output_dim]
         
         # 🔧 恢复原始数据类型
         output = output.to(original_dtype)
         
         return output
-
                                     
 class DiTBlockWithCam(nn.Module):
     """DiT Block with camera embeddings"""
@@ -312,35 +274,24 @@ class DiTBlockWithCam(nn.Module):
         )
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         
-        # self.moe = SekaiModal(
+        # camera pose encoder
+        # self.cpe = Cam_Encoder(
         #     unified_dim=25,
         #     output_dim=dim,
-        #     num_experts=4,
-        #     top_k=2
         # )
 
-    def forward(self, x, context, cam_emb, t_mod, freqs,
-                expert_weights: Optional[torch.Tensor] = None,
-                expert_indices: Optional[torch.Tensor] = None):
+    def forward(self, x, context, cam_emb, t_mod, freqs):
         # Original modulation
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
 
         # Camera embedding branch
-        if cam_emb is not None:
-            sekai_output = self.moe(
-                cam_emb,
-                expert_weights,
-                expert_indices
-            )
-            input_x = input_x + sekai_output
-        elif cam_emb is not None and hasattr(self, 'cam_encoder'):
-            cam_emb = cam_emb.to(self.cam_encoder.weight.dtype)
-            cam_emb = self.cam_encoder(cam_emb)
+        if hasattr(self, 'cpe'):
+            cam_emb = self.cpe(cam_emb)
             input_x = input_x + cam_emb
         else:
-            raise NotImplementedError("")
+            raise NotImplementedError("Camera Pose Encoder not defined. ")
 
         input_x = input_x.to(self.projector.weight.dtype)
 
@@ -566,7 +517,7 @@ class WanModelCam(torch.nn.Module):
         
         # Prepare modality embeddings for main scale (1x) - spatial dim h*w
         start_indice = clean_latent_indices[0][0].item() if clean_latent_indices is not None else 0
-        combined_modality_embeddings = None
+        combined_cam_embeddings = None
         
         # Compatibility with existing cam_emb handling (copied from wan_video_dit_recam_future)
         if cam_emb is not None:
@@ -578,7 +529,7 @@ class WanModelCam(torch.nn.Module):
             # Expand camera to match spatial dimensions for main latents
             target_camera_spatial = target_camera.unsqueeze(2).unsqueeze(3).repeat(1, 1, h, w, 1)
             target_camera_spatial = rearrange(target_camera_spatial, 'b f h w d -> b (f h w) d')
-            combined_modality_embeddings = target_camera_spatial
+            combined_cam_embeddings = target_camera_spatial
         
         # Process clean_latents (1x scale) - based on wan_video_dit_recam_future
         if clean_latents is not None and clean_latent_indices is not None:
@@ -621,7 +572,7 @@ class WanModelCam(torch.nn.Module):
                 # Expand to 1x spatial dim h*w
                 clean_camera_spatial = clean_camera.unsqueeze(2).unsqueeze(3).repeat(1, 1, h, w, 1)
                 clean_camera_spatial = rearrange(clean_camera_spatial, 'b f h w d -> b (f h w) d')
-                combined_modality_embeddings = torch.cat([clean_camera_spatial, combined_modality_embeddings], dim=1)
+                combined_cam_embeddings = torch.cat([clean_camera_spatial, combined_cam_embeddings], dim=1)
             
             # Concatenate clean latents and frequencies to the front
             hidden_states = torch.cat([clean_hidden_states, hidden_states], dim=1)
@@ -683,7 +634,7 @@ class WanModelCam(torch.nn.Module):
                     
                     clean_2x_camera_spatial = clean_2x_camera.unsqueeze(2).unsqueeze(3).repeat(1, 1, clean_2x_h, clean_2x_w, 1)
                     clean_2x_camera_spatial = rearrange(clean_2x_camera_spatial, 'b f h w d -> b (f h w) d')
-                    combined_modality_embeddings = torch.cat([clean_2x_camera_spatial, combined_modality_embeddings], dim=1)
+                    combined_cam_embeddings = torch.cat([clean_2x_camera_spatial, combined_cam_embeddings], dim=1)
                 
                 hidden_states = torch.cat([clean_hidden_states_2x, hidden_states], dim=1)
                 rope_freqs = torch.cat([clean_2x_rope_freqs, rope_freqs], dim=1)
@@ -744,17 +695,15 @@ class WanModelCam(torch.nn.Module):
                     
                     clean_4x_camera_spatial = clean_4x_camera.unsqueeze(2).unsqueeze(3).repeat(1, 1, clean_4x_h, clean_4x_w, 1)
                     clean_4x_camera_spatial = rearrange(clean_4x_camera_spatial, 'b f h w d -> b (f h w) d')
-                    combined_modality_embeddings = torch.cat([clean_4x_camera_spatial, combined_modality_embeddings], dim=1)
+                    combined_cam_embeddings = torch.cat([clean_4x_camera_spatial, combined_cam_embeddings], dim=1)
                 
                 hidden_states = torch.cat([clean_hidden_states_4x, hidden_states], dim=1)
                 rope_freqs = torch.cat([clean_4x_rope_freqs, rope_freqs], dim=1)
         
         rope_freqs = rope_freqs.unsqueeze(2).to(device=hidden_states.device)
+
         
-        processed_sekai_input = {}
-        processed_sekai_input['sekai'] = combined_modality_embeddings
-        
-        return hidden_states, rope_freqs, grid_size, combined_modality_embeddings, processed_sekai_input
+        return hidden_states, rope_freqs, grid_size, combined_cam_embeddings
 
     def forward(self, 
                 latents, timestep, cam_emb,
@@ -765,15 +714,13 @@ class WanModelCam(torch.nn.Module):
                 clean_latents_4x=None, clean_latent_4x_indices=None,
                 **kwargs):
 
-        processed_sekai_input = {}
-        if hasattr(self, 'sekai_processor'):
-            cam_emb = self.sekai_processor(cam_emb)
-            processed_sekai_input['sekai'] = cam_emb
+        if hasattr(self, 'cam_processor'):
+            cam_emb = self.cam_processor(cam_emb)
         else:
-            raise NotImplementedError("Sekai camera embedding processor not defined.")
+            raise NotImplementedError("Cam_Processor not defined.")
 
         # Process multi-scale inputs and RoPE freqs
-        hidden_states, rope_freqs, grid_size, processed_cam_emb, processed_sekai_input = self.process_input_hidden_states(
+        hidden_states, rope_freqs, grid_size, combined_cam_emb = self.process_input_hidden_states(
             latents, latent_indices,
             clean_latents, clean_latent_indices,
             clean_latents_2x, clean_latent_2x_indices,
@@ -811,22 +758,14 @@ class WanModelCam(torch.nn.Module):
         assert rope_freqs.shape[1] == hidden_states.shape[1], \
             f"RoPE freqs sequence length {rope_freqs.shape[1]} does not match hidden_states sequence length {hidden_states.shape[1]}"
         
-        batch_size, seq_len, _ = processed_cam_emb.shape
-        top_k = self.top_k if hasattr(self, 'top_k') else 1
-        
-        expert_indices = torch.full((batch_size, seq_len, top_k), 0, dtype=torch.long, device=processed_cam_emb.device)
-        expert_weights = torch.ones((batch_size, seq_len, top_k), dtype=processed_cam_emb.dtype, device=processed_cam_emb.device)
-
         # Transformer blocks
         for block in self.blocks:
             hidden_states = block(
                 hidden_states, 
                 context, 
-                processed_cam_emb, 
+                combined_cam_emb, 
                 t_mod, 
                 rope_freqs,
-                expert_weights,
-                expert_indices
             )
         
         # Project output only for the original prediction target portion

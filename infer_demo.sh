@@ -1,5 +1,5 @@
 CUDA_VISIBLE_DEVICES=3 python ./scripts/infer_demo.py \
-    --condition_pth ./examples/condition_images/garden_1.png \
+    --condition_image ./examples/condition_images/garden_1.png \
     --start_frame 0 \
     --initial_condition_frames 1 \
     --frames_per_generation 8 \

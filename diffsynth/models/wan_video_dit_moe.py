@@ -968,6 +968,7 @@ class WanModelMoe(torch.nn.Module):
         router_weights, router_indices, total_specialization_loss = None, None, torch.tensor(0.0, device=hidden_states.device)
         active_modality = "unknown"
         
+        # BUG: combined_modality_input 没有起实际作用
         if self.use_moe and processed_modality_inputs:
             # 合并所有模态的输入
             combined_modality_input = None

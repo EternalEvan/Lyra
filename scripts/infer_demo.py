@@ -471,49 +471,52 @@ def inference_framepack_sliding_window(
         os.path.join(wan_model_path, "Wan2.1_VAE.pth"),
     ])
     pipe = WanVideoAstraPipeline.from_model_manager(model_manager, device="cuda")
-
-    # 2. Add traditional camera encoder (compatibility)
-    dim = pipe.dit.blocks[0].self_attn.q.weight.shape[0]
-    for block in pipe.dit.blocks:
-        block.cam_encoder = nn.Linear(13, dim)
-        block.projector = nn.Linear(dim, dim)
-        block.cam_encoder.weight.data.zero_()
-        block.cam_encoder.bias.data.zero_()
-        block.projector.weight = nn.Parameter(torch.eye(dim))
-        block.projector.bias = nn.Parameter(torch.zeros(dim))
     
-    # 3. Add FramePack components
+    # 2. Add FramePack components
     add_framepack_components(pipe.dit)
     
-    # 4. Modifiy the DiT module (add sekai experts for camera control)
-    sekai_config = {
-        "num_experts": num_experts,
-        "top_k": top_k,
-    }
-    from diffsynth.models.wan_video_dit_cam import ModalityProcessor, SekaiModal
-    pipe.dit.sekai_processor = ModalityProcessor("sekai", 13, 25).to(device) # project the input dim to unified dim
+    # 3. Modifiy the DiT module (Lyra uses Cam_Processor & Cam_Encoder)
+    from diffsynth.models.wan_video_dit_cam import Cam_Encoder, Cam_Processor
+    pipe.dit.cam_processor = Cam_Processor(13, 25) # project the input dim to unified dim
     
+    dim = pipe.dit.blocks[0].self_attn.q.weight.shape[0]
     for i, block in enumerate(pipe.dit.blocks):
-        block.moe = SekaiModal(
+        # Add Camera Pose Encoder
+        block.cpe = Cam_Encoder(
             unified_dim=25,
-            output_dim=dim,
-            num_experts=sekai_config.get("num_experts", 4),
-            top_k=sekai_config.get("top_k", 2)
+            output_dim=dim
         )
-    
-    # 5. Load trained weights
+        block.projector = nn.Linear(dim, dim)
+        block.projector.weight = nn.Parameter(torch.eye(dim))
+        block.projector.bias = nn.Parameter(torch.zeros(dim))
+        
+    # 4. Load trained weights
+    key_parts_map = {
+        'sekai_processor': 'cam_processor',
+        'moe.experts.0': 'cpe.encoder'
+    }
     dit_state_dict = torch.load(dit_path, map_location="cpu")
+    
+    # modify parameters name
+    keys_to_replace = []
+    for old_key in dit_state_dict.keys():
+        for old_key_parts in key_parts_map.keys():
+            if isinstance(old_key, str) and old_key_parts in old_key:
+                keys_to_replace.append(old_key)
+                
+    for old_key in keys_to_replace:
+        value = dit_state_dict[old_key]
+        for old_key_parts, new_key_parts in key_parts_map.items():
+            if old_key_parts in old_key:
+                new_key = old_key.replace(old_key_parts, new_key_parts)
+                del dit_state_dict[old_key]
+                dit_state_dict[new_key] = value
+    
     pipe.dit.load_state_dict(dit_state_dict, strict=False)
     pipe = pipe.to(device)
     model_dtype = next(pipe.dit.parameters()).dtype
     
-    if hasattr(pipe.dit, 'clean_x_embedder'):
-        pipe.dit.clean_x_embedder = pipe.dit.clean_x_embedder.to(dtype=model_dtype)
-    
-    # Set denoising steps
-    pipe.scheduler.set_timesteps(50)
-    
-    # 6. Load initial conditions
+    # 5. Load initial conditions
     print("\n🔄 Loading initial condition frames...")
     initial_latents, encoded_data = load_or_encode_condition(
         condition_pth_path,
@@ -524,6 +527,9 @@ def inference_framepack_sliding_window(
         device,
         pipe,
     )
+    
+    # Set denoising steps
+    pipe.scheduler.set_timesteps(50)
     
     # Spatial cropping
     target_height, target_width = 60, 104
@@ -539,7 +545,7 @@ def inference_framepack_sliding_window(
 
     print(f"✅ Initial history_latents shape: {history_latents.shape}\n")
     
-    # 7. Encode prompt - support CFG
+    # 6. Encode prompt - support CFG
     if use_gt_prompt and 'prompt_emb' in encoded_data:
         print("✅ Using pre-encoded GT prompt embedding")
         prompt_emb_pos = encoded_data['prompt_emb']
@@ -573,7 +579,7 @@ def inference_framepack_sliding_window(
             prompt_emb_neg = None
             print("Not using Text CFG\n")
     
-    # 8. Pre-generate complete camera embedding sequence
+    # 7. Pre-generate complete camera embedding sequence
     camera_embedding_full = generate_sekai_camera_embeddings_sliding(
         encoded_data.get('cam_emb', None),
         start_frame,
@@ -586,12 +592,12 @@ def inference_framepack_sliding_window(
     
     print(f"✅ Complete camera sequence shape: {camera_embedding_full.shape}")
     
-    # 9. Create unconditional camera embedding for Camera CFG
+    # 8. Create unconditional camera embedding for Camera CFG
     if use_camera_cfg:
         camera_embedding_uncond = torch.zeros_like(camera_embedding_full)
         print(f"🔄 Creating unconditional camera embedding for CFG")
     
-    # 10. Sliding window generation loop
+    # 9. Sliding window generation loop
     total_generated = 0
     all_generated_frames = []
     
@@ -605,7 +611,7 @@ def inference_framepack_sliding_window(
             history_latents,
             current_generation,
             camera_embedding_full,
-                start_frame,
+            start_frame,
             max_history_frames
         )
         
@@ -774,7 +780,7 @@ def inference_framepack_sliding_window(
         
         print(f"✅ Generated {total_generated}/{total_frames_to_generate} frames")
     
-    # 11. Decode and save
+    # 10. Decode and save
     print("\nDecoding generated video...")
     
     all_generated = torch.cat(all_generated_frames, dim=1)
