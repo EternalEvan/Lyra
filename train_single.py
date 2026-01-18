@@ -1,1039 +1,1390 @@
-# CPE training for fused nuscenes and sekai datasets
-import torch
-import torch.nn as nn
-import lightning as pl
-import wandb
-import os
-import copy
-import json
-import numpy as np
-import random
-import traceback
-from diffsynth import WanVideoAstraPipeline, ModelManager
-
-from torchvision.transforms import v2
-from einops import rearrange
+# Copyright (c) [2025] [FastVideo Team]
+# Copyright (c) [2025] [ByteDance Ltd. and/or its affiliates.]
+# SPDX-License-Identifier: [Apache License 2.0] 
+#
+# This file has been modified by [ByteDance Ltd. and/or its affiliates.] in 2025.
+#
+# Original file was released under [Apache License 2.0], with the full license text
+# available at [https://github.com/hao-ai-lab/FastVideo/blob/main/LICENSE].
+#
+# This modified file is released under the same license.
 
 import argparse
-from scipy.spatial.transform import Rotation as R
+import json
+import math
+import os
+import time
+from typing import Optional
+from collections import deque
+from contextlib import nullcontext
+import pdb
+from datetime import datetime
+
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import numpy as np
+import wandb
+from accelerate.utils import set_seed
+from diffusers.optimization import get_scheduler
+from fastvideo.utils.fsdp_util import apply_fsdp_checkpointing
+from fastvideo.utils.logging_ import main_print
+from fastvideo.utils.parallel_states import (
+    destroy_sequence_parallel_group,
+    get_sequence_parallel_state,
+    initialize_sequence_parallel_state,
+)
+import imageio.v2 as imageio
+from safetensors.torch import save_file
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    get_model_state_dict,
+    set_model_state_dict,
+)
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from tqdm.auto import tqdm
+
+from diffsynth.models import ModelManager
+from diffsynth.pipelines import WanVideoAstraPipeline
+from diffsynth.models.wan_video_dit_moe import WanModelMoe, DiTBlockWithMoE
+from diffsynth.models.wan_video_vae import WanVideoVAE
+from diffsynth.configs.model_config import model_loader_configs
+
+from fastvideo.dataset.spatialvid_datasets import SpatialVidFramePackDataset, framepack_collate_fn
+from reward_model.camera_alignment_reward import CameraAlignmentReward
+from finetune.utils.init_lyra import add_framepack_components, replace_dit_model_in_manager
+from utils.visualization import extract_target_poses_to_txt        
+
+def to_device(batch, device, dtype=None):
+    def _move(x):
+        if isinstance(x, torch.Tensor):
+            target = x.to(device)
+            return target.to(dtype) if dtype and target.dtype != dtype else target
+        if isinstance(x, dict):
+            return {k: _move(v) for k, v in x.items()}
+        return x
+    return _move(batch)
+
+def repeat_for_group(obj, repeats):
+    if obj is None:
+        return None
+    if isinstance(obj, torch.Tensor):
+        return obj.repeat_interleave(repeats, dim=0)
+    if isinstance(obj, dict):
+        return {k: repeat_for_group(v, repeats) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [item for item in obj for _ in range(repeats)]
+    if isinstance(obj, tuple):
+        return tuple(repeat_for_group(list(obj), repeats))
+    return obj
 
 
-def compute_relative_pose(pose_a, pose_b, use_torch=False):
-    """Calculate the relative pose matrix of Camera B with respect to Camera A"""
-    assert pose_a.shape == (4, 4), f"Camera A extrinsic matrix shape should be (4,4), got {pose_a.shape}"
-    assert pose_b.shape == (4, 4), f"Camera B extrinsic matrix shape should be (4,4), got {pose_b.shape}"
+def to_tensor(value, device, dtype=None, batch_dim=True):
+    """确保值为tensor并转移到指定设备"""
+    if value is None:
+        return None
+    tensor = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+    if tensor.numel() == 0:
+        return None
     
-    if use_torch:
-        if not isinstance(pose_a, torch.Tensor):
-            pose_a = torch.from_numpy(pose_a).float()
-        if not isinstance(pose_b, torch.Tensor):
-            pose_b = torch.from_numpy(pose_b).float()
-        
-        pose_a_inv = torch.inverse(pose_a.float())
-        relative_pose = torch.matmul(pose_b.float(), pose_a_inv)
-    else:
-        if not isinstance(pose_a, np.ndarray):
-            pose_a = np.array(pose_a, dtype=np.float32)
-        if not isinstance(pose_b, np.ndarray):
-            pose_b = np.array(pose_b, dtype=np.float32)
-        
-        pose_a_inv = np.linalg.inv(pose_a)
-        relative_pose = np.matmul(pose_b, pose_a_inv)
+    if dtype is None and tensor.dtype.is_floating_point:
+        dtype = None  # 使用原dtype
     
-    return relative_pose
+    tensor = tensor.to(device=device, dtype=dtype)
+    if batch_dim and tensor.dim() == 4:
+        tensor = tensor.unsqueeze(0)
+    elif not batch_dim and tensor.dim() == 1:
+        tensor = tensor.unsqueeze(0)
+    elif not batch_dim and tensor.dim() == 0:
+        tensor = tensor.view(1, 1)
+    
+    return tensor
 
-def compute_relative_pose_matrix(pose1, pose2):
+
+def prepare_condition_for_sample(batch, sample_index, device, model_dtype):
     """
-    Compute relative pose between adjacent frames, returning a 3x4 camera matrix [R_rel | t_rel]
-    
+    为单个样本的采样准备条件
     Args:
-        pose1: Camera pose of frame i, array of shape (7,) [tx1, ty1, tz1, qx1, qy1, qz1, qw1]
-        pose2: Camera pose of frame i+1, array of shape (7,) [tx2, ty2, tz2, qx2, qy2, qz2, qw2]
+        batch: 批次数据
+        sample_index: 样本索引
+        device: 设备
+        model_dtype: 模型数据类型
     
     Returns:
-        relative_matrix: 3x4 relative pose matrix, where first 3 cols are R_rel, 4th col is t_rel
+        tuple: (conditioning, gt_extrinsics_tensor, prompt_text)
     """
+    # 提取数据集信息
+    dataset_type = batch.get("dataset_type", ["sekai"])[0]
+    dataset_name = batch.get("dataset_name", ["unknown"])[0]
     
-    pose1 = pose1.detach().to(torch.float64).cpu().numpy()
-    pose2 = pose2.detach().to(torch.float64).cpu().numpy()
+    # 准备相机嵌入
+    cam_emb = None
+    camera_batch = batch.get("camera")
+    if camera_batch is not None:
+        cam_value = camera_batch[sample_index]
+        cam_emb = to_tensor(cam_value, device, model_dtype, batch_dim=False)
+        if cam_emb.dim() == 2:
+            cam_emb = cam_emb.unsqueeze(0)
     
-    # Separate translation vector and quaternion
-    t1 = pose1[:3]  # Translation of frame i
-    q1 = pose1[3:]  # Quaternion of frame i
-    t2 = pose2[:3]  # Translation of frame i+1
-    q2 = pose2[3:]  # Quaternion of frame i+1
+    # 准备模态输入
+    modality_inputs = {}
+    if cam_emb is not None:
+        modality_key = dataset_type if dataset_type in ("sekai", "nuscenes", "openx") else "sekai"
+        modality_inputs[modality_key] = cam_emb.clone()
+    modality_inputs = modality_inputs or None
     
-    # 1. Compute relative rotation matrix R_rel
-    rot1 = R.from_quat(q1)  
-    rot2 = R.from_quat(q2)  
-    rot_rel = rot2 * rot1.inv()  # Relative rotation = R2 * R1_inv
-    R_rel = rot_rel.as_matrix()  
-    
-    # 2. Compute relative translation vector t_rel
-    R1_T = rot1.as_matrix().T  # Transpose of first rotation (equivalent to inverse)
-    t_rel = R1_T @ (t2 - t1)   # Relative translation = R1^T * (t2 - t1)
-    
-    # 3. Combine into 3x4 matrix [R_rel | t_rel]
-    relative_matrix = np.hstack([R_rel, t_rel.reshape(3, 1)])
-    
-    return relative_matrix
-
-class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
-    """Multi-dataset dynamic history length dataset supporting FramePack - Fusion of nuscenes and sekai"""
-    
-    def __init__(self, dataset_configs, steps_per_epoch, 
-                 min_condition_frames=10, max_condition_frames=40,
-                 target_frames=10, height=900, width=1600):
-        """
-        Args:
-            dataset_configs: List of dataset configs, each containing {
-                'name': dataset name,
-                'manifest': path to manifest files,
-                'type': dataset type ('sekai' or 'nuscenes'),
-                'weight': sampling weight
-            }
-        """
-        self.dataset_configs = dataset_configs
-        self.min_condition_frames = min_condition_frames
-        self.max_condition_frames = max_condition_frames
-        self.target_frames = target_frames
-        self.height = height
-        self.width = width
-        self.steps_per_epoch = steps_per_epoch
-        
-        # VAE temporal compression ratio
-        self.time_compression_ratio = 4
-        
-        # 🔧 Scan all datasets to build a unified scene index
-        self.scene_dirs = []
-        self.dataset_info = {}  # Store dataset info for each scene
-        self.dataset_weights = []  # Sampling weight for each scene
-        
-        total_scenes = 0
-        
-        for config in self.dataset_configs:
-            dataset_name = config['name']
-            dataset_manifests = config['manifest'] if isinstance(config['manifest'], list) else [config['manifest']]
-            dataset_type = config['type']
-            dataset_weight = config.get('weight', 1.0)
-            
-            print(f"🔧 Scanning dataset: {dataset_name} (Type: {dataset_type})")
-            
-            dataset_scenes = []
-            for dataset_manifest in dataset_manifests:
-                print(f"  📁 Checking path: {dataset_manifest}")
-                dataset_dir = os.path.dirname(dataset_manifest)
-                if os.path.exists(dataset_manifest):
-                    with open(dataset_manifest, "r") as f:
-                        data = json.load(f)
-                        pth_list = [d["pth"] for d in data["entries"]]
-                        print(f"  📁 Found {len(pth_list)} paths from manifest")
-                        for pth in pth_list:
-                            scene_dir = os.path.join(dataset_dir, pth)
-                            if not os.path.exists(scene_dir):
-                                print(f"  ❌ Path does not exist: {scene_dir}")
-                                continue
-                            else:
-                                self.scene_dirs.append(scene_dir)
-                                dataset_scenes.append(scene_dir)
-                                self.dataset_info[scene_dir] = {
-                                    'name': dataset_name,
-                                    'type': dataset_type,
-                                    'weight': dataset_weight
-                                }
-                                self.dataset_weights.append(dataset_weight)      
-                else:
-                    print(f"  ❌ Path does not exist: {dataset_manifest}")
-                
-                print(f"  ✅ Found {len(dataset_scenes)} scenes")
-                total_scenes += len(dataset_scenes)
-                    
-        # Stats for each dataset
-        dataset_counts = {}
-        for scene_dir in self.scene_dirs:
-            dataset_name = self.dataset_info[scene_dir]['name']
-            dataset_type = self.dataset_info[scene_dir]['type']
-            key = f"{dataset_name} ({dataset_type})"
-            dataset_counts[key] = dataset_counts.get(key, 0) + 1
-        
-        for dataset_key, count in dataset_counts.items():
-            print(f"  - {dataset_key}: {count} scenes")
-        
-        assert len(self.scene_dirs) > 0, "No encoded scenes found!"
-        
-        # 🔧 Calculate sampling probabilities
-        total_weight = sum(self.dataset_weights)
-        self.sampling_probs = [w / total_weight for w in self.dataset_weights]
-
-    def select_dynamic_segment_nuscenes(self, scene_info):
-        """🔧 NuScenes-specific FramePack style segment selection"""
-        keyframe_indices = scene_info['keyframe_indices']  # Original frame indices
-        total_frames = scene_info['total_frames']  # Total original frames
-        
-        if len(keyframe_indices) < 2:
-            return None
-        
-        # Calculate compressed frame counts
-        compressed_total_frames = total_frames // self.time_compression_ratio
-        compressed_keyframe_indices = [idx // self.time_compression_ratio for idx in keyframe_indices]
-        
-        min_condition_compressed = self.min_condition_frames // self.time_compression_ratio
-        max_condition_compressed = self.max_condition_frames // self.time_compression_ratio
-        target_frames_compressed = self.target_frames // self.time_compression_ratio
-        
-        # FramePack style sampling strategy
-        ratio = random.random()
-        if ratio < 0.15:
-            condition_frames_compressed = 1
-        elif 0.15 <= ratio < 0.9:
-            condition_frames_compressed = random.randint(min_condition_compressed, max_condition_compressed)
-        else:
-            condition_frames_compressed = target_frames_compressed
-        
-        # Ensure sufficient frame count
-        min_required_frames = condition_frames_compressed + target_frames_compressed
-        if compressed_total_frames < min_required_frames:
-            return None
-        
-        start_frame_compressed = random.randint(0, compressed_total_frames - min_required_frames - 1)
-        condition_end_compressed = start_frame_compressed + condition_frames_compressed
-        target_end_compressed = condition_end_compressed + target_frames_compressed
-
-        # FramePack style index processing
-        latent_indices = torch.arange(condition_end_compressed, target_end_compressed)
-        
-        # 1x frames: Start frame + Last 1 frame
-        clean_latent_indices_start = torch.tensor([start_frame_compressed])
-        clean_latent_1x_indices = torch.tensor([condition_end_compressed - 1])
-        clean_latent_indices = torch.cat([clean_latent_indices_start, clean_latent_1x_indices])
-        
-        # 🔧 2x frames: Determine based on actual condition length
-        if condition_frames_compressed >= 2:
-            # Take last 2 frames (if available)
-            clean_latent_2x_start = max(start_frame_compressed, condition_end_compressed - 2)
-            clean_latent_2x_indices = torch.arange(clean_latent_2x_start-1, condition_end_compressed-1)
-        else:
-            # Empty index if condition is less than 2 frames
-            clean_latent_2x_indices = torch.tensor([], dtype=torch.long)
-        
-        # 🔧 4x frames: Max 16 frames history
-        if condition_frames_compressed >= 1:
-            clean_4x_start = max(start_frame_compressed, condition_end_compressed - 16)
-            clean_latent_4x_indices = torch.arange(clean_4x_start-3, condition_end_compressed-3)
-        else:
-            clean_latent_4x_indices = torch.tensor([], dtype=torch.long)
-                    
-        # 🔧 NuScenes specific: Find keyframe indices
-        condition_keyframes_compressed = [idx for idx in compressed_keyframe_indices 
-                                        if start_frame_compressed <= idx < condition_end_compressed]
-        
-        target_keyframes_compressed = [idx for idx in compressed_keyframe_indices 
-                                    if condition_end_compressed <= idx < target_end_compressed]
-        
-        if not condition_keyframes_compressed:
-            return None
-        
-        # Use last keyframe of condition segment as reference
-        reference_keyframe_compressed = max(condition_keyframes_compressed)
-        
-        # Map back to original keyframe index for pose lookup
-        reference_keyframe_original_idx = None
-        for i, compressed_idx in enumerate(compressed_keyframe_indices):
-            if compressed_idx == reference_keyframe_compressed:
-                reference_keyframe_original_idx = i
-                break
-        
-        if reference_keyframe_original_idx is None:
-            return None
-        
-        # Map target segment to original keyframe indices
-        target_keyframes_original_indices = []
-        for compressed_idx in target_keyframes_compressed:
-            for i, comp_idx in enumerate(compressed_keyframe_indices):
-                if comp_idx == compressed_idx:
-                    target_keyframes_original_indices.append(i)
-                    break
-        
-        # Original keyframe indices
-        keyframe_original_idx = []
-        for compressed_idx in range(start_frame_compressed, target_end_compressed):
-            keyframe_original_idx.append(compressed_idx * 4)
-        
-        return {
-            'start_frame': start_frame_compressed,
-            'condition_frames': condition_frames_compressed,
-            'target_frames': target_frames_compressed,
-            'condition_range': (start_frame_compressed, condition_end_compressed),
-            'target_range': (condition_end_compressed, target_end_compressed),
-            
-            # FramePack style indices
-            'latent_indices': latent_indices,
-            'clean_latent_indices': clean_latent_indices,
-            'clean_latent_2x_indices': clean_latent_2x_indices,
-            'clean_latent_4x_indices': clean_latent_4x_indices,
-            
-            'keyframe_original_idx': keyframe_original_idx,
-            'original_condition_frames': condition_frames_compressed * self.time_compression_ratio,
-            'original_target_frames': target_frames_compressed * self.time_compression_ratio,
-            
-            # 🔧 NuScenes specific data
-            'reference_keyframe_idx': reference_keyframe_original_idx,
-            'target_keyframe_indices': target_keyframes_original_indices,
-        }
-
-    def calculate_relative_rotation(self, current_rotation, reference_rotation):
-        """Calculate relative rotation quaternion - NuScenes specific"""
-        q_current = torch.tensor(current_rotation, dtype=torch.float32)
-        q_ref = torch.tensor(reference_rotation, dtype=torch.float32)
-
-        q_ref_inv = torch.tensor([q_ref[0], -q_ref[1], -q_ref[2], -q_ref[3]])
-
-        w1, x1, y1, z1 = q_ref_inv
-        w2, x2, y2, z2 = q_current
-
-        relative_rotation = torch.tensor([
-            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
-            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
-        ])
-
-        return relative_rotation
-
-
-    def prepare_framepack_inputs(self, full_latents, segment_info):
-        """🔧 Prepare multi-scale inputs for FramePack - Corrected version handling empty indices"""
-        # 🔧 Fix: handle 4D input [C, T, H, W], add batch dimension
-        if len(full_latents.shape) == 4:
-            full_latents = full_latents.unsqueeze(0)  # [C, T, H, W] -> [1, C, T, H, W]
-            B, C, T, H, W = full_latents.shape
-        else:
-            B, C, T, H, W = full_latents.shape
-        
-        # Primary latents (for denoising prediction)
-        latent_indices = segment_info['latent_indices']
-        main_latents = full_latents[:, :, latent_indices, :, :]
-        
-        # 🔧 1x Condition frames (Start + Last 1)
-        clean_latent_indices = segment_info['clean_latent_indices']
-        clean_latents = full_latents[:, :, clean_latent_indices, :, :]
-        
-        # 🔧 4x Condition frames - Always 16 frames, padded with 0 if necessary
-        clean_latent_4x_indices = segment_info['clean_latent_4x_indices']
-        clean_latents_4x = torch.zeros(B, C, 16, H, W, dtype=full_latents.dtype)
-        clean_latent_4x_indices_final = torch.full((16,), -1, dtype=torch.long)  # -1 for padding
-        
-        if len(clean_latent_4x_indices) > 0:
-            actual_4x_frames = len(clean_latent_4x_indices)
-            start_pos = max(0, 16 - actual_4x_frames)
-            end_pos = 16
-            actual_start = max(0, actual_4x_frames - 16)
-            
-            clean_latents_4x[:, :, start_pos:end_pos, :, :] = full_latents[:, :, clean_latent_4x_indices[actual_start:], :, :]
-            clean_latent_4x_indices_final[start_pos:end_pos] = clean_latent_4x_indices[actual_start:]
-        
-        # 🔧 2x Condition frames - Always 2 frames
-        clean_latent_2x_indices = segment_info['clean_latent_2x_indices']
-        clean_latents_2x = torch.zeros(B, C, 2, H, W, dtype=full_latents.dtype)
-        clean_latent_2x_indices_final = torch.full((2,), -1, dtype=torch.long)
-        
-        if len(clean_latent_2x_indices) > 0:
-            actual_2x_frames = len(clean_latent_2x_indices)
-            start_pos = max(0, 2 - actual_2x_frames)
-            end_pos = 2
-            actual_start = max(0, actual_2x_frames - 2)
-            
-            clean_latents_2x[:, :, start_pos:end_pos, :, :] = full_latents[:, :, clean_latent_2x_indices[actual_start:], :, :]
-            clean_latent_2x_indices_final[start_pos:end_pos] = clean_latent_2x_indices[actual_start:]
-        
-        if B == 1:
-            main_latents = main_latents.squeeze(0)
-            clean_latents = clean_latents.squeeze(0)
-            clean_latents_2x = clean_latents_2x.squeeze(0)
-            clean_latents_4x = clean_latents_4x.squeeze(0)
-        
-        return {
-            'latents': main_latents,
-            'clean_latents': clean_latents,
-            'clean_latents_2x': clean_latents_2x,
-            'clean_latents_4x': clean_latents_4x,
-            'latent_indices': segment_info['latent_indices'],
-            'clean_latent_indices': segment_info['clean_latent_indices'],
-            'clean_latent_2x_indices': clean_latent_2x_indices_final,
-            'clean_latent_4x_indices': clean_latent_4x_indices_final,
-        }
-
-    def create_sekai_pose_embeddings(self, cam_data, segment_info):
-        """Create Sekai-style pose embeddings"""
-        cam_data_seq = cam_data['extrinsic']
-        
-        # Compute relative pose for all frames
-        all_keyframe_indices = []
-        for compressed_idx in range(segment_info['start_frame'], segment_info['target_range'][1]):
-            all_keyframe_indices.append(compressed_idx * 4)
-        
-        relative_cams = []
-        for idx in all_keyframe_indices:
-            cam_prev = cam_data_seq[idx]
-            cam_next = cam_data_seq[idx + 4]
-            relative_cam = compute_relative_pose(cam_prev, cam_next)
-            relative_cams.append(torch.as_tensor(relative_cam[:3, :]))
-        
-        pose_embedding = torch.stack(relative_cams, dim=0)
-        pose_embedding = rearrange(pose_embedding, 'b c d -> b (c d)')
-        pose_embedding = pose_embedding.to(torch.bfloat16)
-
-        return pose_embedding
-
-    def create_openx_pose_embeddings(self, cam_data, segment_info):
-        """🔧 Create OpenX-style pose embeddings"""
-        cam_data_seq = cam_data['extrinsic']
-        
-        all_keyframe_indices = []
-        for compressed_idx in range(segment_info['start_frame'], segment_info['target_range'][1]):
-            keyframe_idx = compressed_idx * 4
-            if keyframe_idx + 4 < len(cam_data_seq):
-                all_keyframe_indices.append(keyframe_idx)
-        
-        relative_cams = []
-        for idx in all_keyframe_indices:
-            if idx + 4 < len(cam_data_seq):
-                cam_prev = cam_data_seq[idx]
-                cam_next = cam_data_seq[idx + 4]
-                relative_cam = compute_relative_pose(cam_prev, cam_next)
-                relative_cams.append(torch.as_tensor(relative_cam[:3, :]))
-            else:
-                identity_cam = torch.eye(3, 4)
-                relative_cams.append(identity_cam)
-        
-        if len(relative_cams) == 0:
-            return None
-            
-        pose_embedding = torch.stack(relative_cams, dim=0)
-        pose_embedding = rearrange(pose_embedding, 'b c d -> b (c d)')
-        pose_embedding = pose_embedding.to(torch.bfloat16)
-
-        return pose_embedding
-    
-    def create_spatialvid_pose_embeddings(self, cam_data, segment_info):
-        """🔧 Create SpatialVid-style pose embeddings - camera interval is 1 frame instead of 4"""
-        cam_data_seq = cam_data['extrinsic']   # N * 4 * 4
-        
-        # 🔧 Compute camera embedding for all frames (condition + target)
-        keyframe_original_idx = segment_info['keyframe_original_idx']
-        
-        relative_cams = []
-        for idx in keyframe_original_idx:
-            if idx + 1 < len(cam_data_seq):
-                cam_prev = cam_data_seq[idx]
-                cam_next = cam_data_seq[idx + 1]  
-                relative_cam = compute_relative_pose_matrix(cam_prev, cam_next)
-                relative_cams.append(torch.as_tensor(relative_cam[:3, :]))
-            else:
-                identity_cam = torch.zeros(3, 4)
-                relative_cams.append(identity_cam)
-        
-        if len(relative_cams) == 0:
-            return None
-            
-        pose_embedding = torch.stack(relative_cams, dim=0)
-        pose_embedding = rearrange(pose_embedding, 'b c d -> b (c d)')
-        pose_embedding = pose_embedding.to(torch.bfloat16)
-
-        return pose_embedding
-               
-    def create_nuscenes_pose_embeddings_framepack(self, scene_info, segment_info):
-        """Create NuScenes-style pose embeddings - FramePack version (simplified 7D)"""
-        keyframe_poses = scene_info['keyframe_poses']
-        reference_keyframe_idx = segment_info['reference_keyframe_idx']
-        target_keyframe_indices = segment_info['target_keyframe_indices']
-        
-        if reference_keyframe_idx >= len(keyframe_poses):
-            return None
-        
-        reference_pose = keyframe_poses[reference_keyframe_idx]
-        
-        # Create pose embeddings for all frames
-        start_frame = segment_info['start_frame']
-        condition_end_compressed = start_frame + segment_info['condition_frames']
-        target_end_compressed = condition_end_compressed + segment_info['target_frames']
-        
-        compressed_keyframe_indices = [idx // self.time_compression_ratio for idx in scene_info['keyframe_indices']]
-        
-        condition_keyframes_compressed = [idx for idx in compressed_keyframe_indices 
-                                        if start_frame <= idx < condition_end_compressed]
-        
-        condition_keyframes_original_indices = []
-        for compressed_idx in condition_keyframes_compressed:
-            for i, comp_idx in enumerate(compressed_keyframe_indices):
-                if comp_idx == compressed_idx:
-                    condition_keyframes_original_indices.append(i)
-                    break
-        
-        pose_vecs = []
-        
-        # Compute pose for condition frames
-        for i in range(segment_info['condition_frames']):
-            if not condition_keyframes_original_indices:
-                translation = torch.zeros(3, dtype=torch.float32)
-                rotation = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float32)
-            else:
-                if len(condition_keyframes_original_indices) == 1:
-                    keyframe_idx = condition_keyframes_original_indices[0]
-                else:
-                    if segment_info['condition_frames'] == 1:
-                        keyframe_idx = condition_keyframes_original_indices[0]
-                    else:
-                        interp_ratio = i / (segment_info['condition_frames'] - 1)
-                        interp_idx = int(interp_ratio * (len(condition_keyframes_original_indices) - 1))
-                        keyframe_idx = condition_keyframes_original_indices[interp_idx]
-                
-                if keyframe_idx >= len(keyframe_poses):
-                    translation = torch.zeros(3, dtype=torch.float32)
-                    rotation = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float32)
-                else:
-                    condition_pose = keyframe_poses[keyframe_idx]
-                    translation = torch.tensor(
-                        np.array(condition_pose['translation']) - np.array(reference_pose['translation']),
-                        dtype=torch.float32
-                    )
-                    rotation = self.calculate_relative_rotation(condition_pose['rotation'], reference_pose['rotation'])
-            
-            pose_vec = torch.cat([translation, rotation], dim=0)  # [7D]
-            pose_vecs.append(pose_vec)
-        
-        # Compute pose for target frames
-        if not target_keyframe_indices:
-            for i in range(segment_info['target_frames']):
-                pose_vec = torch.cat([
-                    torch.zeros(3, dtype=torch.float32),
-                    torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float32),
-                ], dim=0)
-                pose_vecs.append(pose_vec)
-        else:
-            for i in range(segment_info['target_frames']):
-                if len(target_keyframe_indices) == 1:
-                    target_keyframe_idx = target_keyframe_indices[0]
-                else:
-                    if segment_info['target_frames'] == 1:
-                        target_keyframe_idx = target_keyframe_indices[0]
-                    else:
-                        interp_ratio = i / (segment_info['target_frames'] - 1)
-                        interp_idx = int(interp_ratio * (len(target_keyframe_indices) - 1))
-                        target_keyframe_idx = target_keyframe_indices[interp_idx]
-                
-                if target_keyframe_idx >= len(keyframe_poses):
-                    pose_vec = torch.cat([
-                        torch.zeros(3, dtype=torch.float32),
-                        torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float32),
-                    ], dim=0)
-                else:
-                    target_pose = keyframe_poses[target_keyframe_idx]
-                    relative_translation = torch.tensor(
-                        np.array(target_pose['translation']) - np.array(reference_pose['translation']),
-                        dtype=torch.float32
-                    )
-                    relative_rotation = self.calculate_relative_rotation(target_pose['rotation'], reference_pose['rotation'])
-                    pose_vec = torch.cat([relative_translation, relative_rotation], dim=0)
-                
-                pose_vecs.append(pose_vec)
-        
-        if not pose_vecs:
-            return None
-        
-        pose_sequence = torch.stack(pose_vecs, dim=0)  # [total_frames, 7]
-        return pose_sequence
-
-    def create_pose_embeddings(self, cam_data, segment_info, dataset_type, scene_info=None):
-        """🔧 Create pose embeddings based on dataset type"""
-        if dataset_type == 'nuscenes' and scene_info is not None:
-            return self.create_nuscenes_pose_embeddings_framepack(scene_info, segment_info)
-        elif dataset_type == 'spatialvid':  
-            return self.create_spatialvid_pose_embeddings(cam_data, segment_info)
-        elif dataset_type == 'sekai':
-            return self.create_sekai_pose_embeddings(cam_data, segment_info)
-        elif dataset_type == 'openx':  
-            return self.create_openx_pose_embeddings(cam_data, segment_info)
-
-    def select_dynamic_segment(self, full_latents, dataset_type, scene_info=None):
-        """🔧 Use different segment selection strategies per dataset type"""
-        if dataset_type == 'nuscenes' and scene_info is not None:
-            return self.select_dynamic_segment_nuscenes(scene_info)
-        else:
-            total_lens = full_latents.shape[2]
-            
-            min_condition_compressed = self.min_condition_frames // self.time_compression_ratio
-            max_condition_compressed = self.max_condition_frames // self.time_compression_ratio
-            target_frames_compressed = self.target_frames // self.time_compression_ratio
-            max_condition_compressed = min(total_lens-target_frames_compressed-1, max_condition_compressed)
-
-            # 🔧 Special case: spatialvid has 40% probability of using only the first frame as condition
-            if dataset_type == 'spatialvid':
-                ratio = random.random()
-                if ratio < 0.4:
-                    condition_frames_compressed = 1
-                elif ratio < 0.9:
-                    condition_frames_compressed = random.randint(min_condition_compressed, max_condition_compressed)
-                else:
-                    condition_frames_compressed = target_frames_compressed
-            else:
-                ratio = random.random()
-                if ratio < 0.15:
-                    condition_frames_compressed = 1
-                elif 0.15 <= ratio < 0.9 or total_lens <= 2*target_frames_compressed + 1:
-                    condition_frames_compressed = random.randint(min_condition_compressed, max_condition_compressed)
-                else:
-                    condition_frames_compressed = target_frames_compressed
-            
-            min_required_frames = condition_frames_compressed + target_frames_compressed
-            if total_lens < min_required_frames:
-                return None
-            
-            start_frame_compressed = random.randint(0, total_lens - min_required_frames)
-            condition_end_compressed = start_frame_compressed + condition_frames_compressed
-            target_end_compressed = condition_end_compressed + target_frames_compressed
-
-            latent_indices = torch.arange(condition_end_compressed, target_end_compressed)
-            
-            clean_latent_indices_start = torch.tensor([start_frame_compressed])
-            clean_latent_1x_indices = torch.tensor([condition_end_compressed - 1])
-            clean_latent_indices = torch.cat([clean_latent_indices_start, clean_latent_1x_indices])
-            
-            if condition_frames_compressed >= 2:
-                clean_latent_2x_start = max(start_frame_compressed, condition_end_compressed - 2-1)
-                clean_latent_2x_indices = torch.arange(clean_latent_2x_start, condition_end_compressed-1)
-            else:
-                clean_latent_2x_indices = torch.tensor([], dtype=torch.long)
-            
-            if condition_frames_compressed > 3:
-                clean_4x_start = max(start_frame_compressed, condition_end_compressed - 16-3)
-                clean_latent_4x_indices = torch.arange(clean_4x_start, condition_end_compressed-3)
-            else:
-                clean_latent_4x_indices = torch.tensor([], dtype=torch.long)
-            
-            keyframe_original_idx = []
-            for compressed_idx in range(start_frame_compressed, target_end_compressed):
-                if dataset_type == 'spatialvid':
-                    keyframe_original_idx.append(compressed_idx)
-                elif dataset_type in ['openx', 'sekai']:
-                    keyframe_original_idx.append(compressed_idx * 4)
-
-            return {
-                'start_frame': start_frame_compressed,
-                'condition_frames': condition_frames_compressed,
-                'target_frames': target_frames_compressed,
-                'condition_range': (start_frame_compressed, condition_end_compressed),
-                'target_range': (condition_end_compressed, target_end_compressed),
-                'latent_indices': latent_indices,
-                'clean_latent_indices': clean_latent_indices,
-                'clean_latent_2x_indices': clean_latent_2x_indices,
-                'clean_latent_4x_indices': clean_latent_4x_indices,
-                'keyframe_original_idx': keyframe_original_idx,
-                'original_condition_frames': condition_frames_compressed * self.time_compression_ratio,
-                'original_target_frames': target_frames_compressed * self.time_compression_ratio,
-                'use_first_latent': dataset_type == 'spatialvid' and condition_frames_compressed == 1,
-            }
-
-    def __getitem__(self, index):
-        while True:
-            try:
-                # Randomly select a scene based on weights
-                scene_idx = np.random.choice(len(self.scene_dirs), p=self.sampling_probs)
-                scene_dir = self.scene_dirs[scene_idx]
-                dataset_info = self.dataset_info[scene_dir]
-                
-                dataset_name = dataset_info['name']
-                dataset_type = dataset_info['type']
-                
-                # 🔧 Load data based on dataset type
-                scene_info = None
-                # if dataset_type == 'nuscenes':
-                #     scene_info_path = os.path.join(scene_dir, "scene_info.json")
-                #     if os.path.exists(scene_info_path):
-                #         with open(scene_info_path, 'r') as f:
-                #             scene_info = json.load(f)
-                    
-                #     encoded_path = os.path.join(scene_dir, "encoded_video-480p.pth")
-                #     if not os.path.exists(encoded_path):
-                #         encoded_path = os.path.join(scene_dir, "encoded_video.pth")
-                    
-                #     encoded_data = torch.load(encoded_path, weights_only=True, map_location="cpu")
-                # else:
-                encoded_path = scene_dir
-                encoded_data = torch.load(encoded_path, weights_only=False, map_location="cpu")
-                
-                full_latents = encoded_data['latents']
-                if full_latents.shape[1] <= 10:
-                    continue
-                cam_data = encoded_data.get('cam_emb', encoded_data)
-                
-                # 🔧 Verify NuScenes latent frame counts
-                if dataset_type == 'nuscenes' and scene_info is not None:
-                    expected_latent_frames = scene_info['total_frames'] // self.time_compression_ratio
-                    actual_latent_frames = full_latents.shape[1]
-                    
-                    if abs(actual_latent_frames - expected_latent_frames) > 2:
-                        print(f"⚠️ NuScenes Latent frame mismatch, skipping sample")
-                        continue
-                
-                segment_info = self.select_dynamic_segment(full_latents, dataset_type, scene_info)
-                if segment_info is None:
-                    continue
-                
-                # 🔧 Load first_latent if specified for spatialvid
-                if segment_info.get('use_first_latent', False):
-                    first_latent_data = encoded_data["latents_first"]
-                    full_latents[:, :, 0:1, :, :] = first_latent_data
-                    print(f"✅ SpatialVid: Using first_latent.pth as condition")
-
-                all_camera_embeddings = self.create_pose_embeddings(cam_data, segment_info, dataset_type, scene_info)
-                if all_camera_embeddings is None:
-                    continue
-                
-                framepack_inputs = self.prepare_framepack_inputs(full_latents, segment_info)
-                
-                n = segment_info["condition_frames"]
-                m = segment_info['target_frames']
-                
-                # Process camera embedding with mask
-                mask = torch.zeros(n+m, dtype=torch.float32)
-                mask[:n] = 1.0
-                mask = mask.view(-1, 1)
-                camera_with_mask = torch.cat([all_camera_embeddings, mask], dim=1)
-                
-                result = {
-                    "latents": framepack_inputs['latents'],
-                    "clean_latents": framepack_inputs['clean_latents'],
-                    "clean_latents_2x": framepack_inputs['clean_latents_2x'],
-                    "clean_latents_4x": framepack_inputs['clean_latents_4x'],
-                    "latent_indices": framepack_inputs['latent_indices'],
-                    "clean_latent_indices": framepack_inputs['clean_latent_indices'],
-                    "clean_latent_2x_indices": framepack_inputs['clean_latent_2x_indices'],
-                    "clean_latent_4x_indices": framepack_inputs['clean_latent_4x_indices'],
-                    "camera": camera_with_mask,
-                    "prompt_emb": encoded_data["prompt_emb"],
-                    "image_emb": encoded_data.get("image_emb", {}),
-                    "condition_frames": n,
-                    "target_frames": m,
-                    "scene_name": os.path.basename(scene_dir),
-                    "dataset_name": dataset_name,
-                    "dataset_type": dataset_type,
-                    "original_condition_frames": segment_info['original_condition_frames'],
-                    "original_target_frames": segment_info['original_target_frames'],
-                    "use_first_latent": segment_info.get('use_first_latent', False),
-                }
-                
-                return result
-                
-            except Exception as e:
-                print(f"Error loading sample: {e}")
-                traceback.print_exc()
-                continue
-
-    def __len__(self):
-        return self.steps_per_epoch
-
-def replace_dit_model_in_manager():
-    """Replace DiT model class with camera version"""
-    from diffsynth.models.wan_video_dit_cam import WanModelCam
-    from diffsynth.configs.model_config import model_loader_configs
-
-    for i, config in enumerate(model_loader_configs):
-        keys_hash, keys_hash_with_shape, model_names, model_classes, model_resource = config
-
-        if 'wan_video_dit' in model_names:
-            new_model_names = []
-            new_model_classes = []
-
-            for name, cls in zip(model_names, model_classes):
-                if name == 'wan_video_dit':
-                    new_model_names.append(name)
-                    new_model_classes.append(WanModelCam)
-                else:
-                    new_model_names.append(name)
-                    new_model_classes.append(cls)
-
-            model_loader_configs[i] = (keys_hash, keys_hash_with_shape, new_model_names, new_model_classes, model_resource)
-
-class MultiDatasetLightningModelForTrain(pl.LightningModule):
-    def __init__(
-        self,
-        dit_path,
-        learning_rate=1e-5,
-        use_gradient_checkpointing=True,
-        use_gradient_checkpointing_offload=False,
-        resume_ckpt_path=None,
-    ):
-        super().__init__()
-        
-        replace_dit_model_in_manager()
-        model_manager = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
-        
-        if os.path.isfile(dit_path):
-            model_manager.load_models([dit_path])
-        else:
-            dit_path = dit_path.split(",")
-            model_manager.load_models([dit_path])
-        
-        #model_manager.load_models(["./models/Wan-AI/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth"])
-        model_manager.load_models(["/share_zhuyixuan05/zhuyixuan05/models--Wan-AI--Wan2.1-T2V-1.3B/snapshots/37ec512624d61f7aa208f7ea8140a131f93afc9a/Wan2.1_VAE.pth"])
-        
-        self.pipe = WanVideoAstraPipeline.from_model_manager(model_manager)
-        self.pipe.scheduler.set_timesteps(1000, training=True)
-
-        # 🔧 Add FramePack components
-        self.add_framepack_components()
-        
-        # 🔧 Add Camera Pose Encoder
-        self.add_cpe_components()
-        
-        dim = self.pipe.dit.blocks[0].self_attn.q.weight.shape[0]
-        for block in self.pipe.dit.blocks:
-            # 🔧 Simplified: Only add standard camera encoder
-            block.cam_encoder = nn.Linear(13, dim)
-            block.projector = nn.Linear(dim, dim)
-            block.cam_encoder.weight.data.zero_()
-            block.cam_encoder.bias.data.zero_()
-            block.projector.weight = nn.Parameter(torch.eye(dim))
-            block.projector.bias = nn.Parameter(torch.zeros(dim))
-        
-        if resume_ckpt_path is not None:
-            state_dict = torch.load(resume_ckpt_path, map_location="cpu")
-            state_dict.pop("global_router.weight", None)
-            state_dict.pop("global_router.bias", None)
-            self.pipe.dit.load_state_dict(state_dict, strict=False)
-            print('Load checkpoint:', resume_ckpt_path)
-
-        self.freeze_parameters()
-        
-        # 🔧 Set trainable parameters
-        for name, module in self.pipe.denoising_model().named_modules():
-            if any(keyword in name for keyword in ["cam_encoder", "projector", "self_attn", "clean_x_embedder", "cpe", "cam_processor"]):
-                for param in module.parameters():
-                    param.requires_grad = True
-        
-        self.learning_rate = learning_rate
-        self.use_gradient_checkpointing = use_gradient_checkpointing
-        self.use_gradient_checkpointing_offload = use_gradient_checkpointing_offload
-        
-        os.makedirs("multi_dataset_dynamic/visualizations", exist_ok=True)
-
-    def add_cpe_components(self):
-        '''🔧 Add Camera Pose Encoder components'''
-        from diffsynth.models.wan_video_dit_cam import Cam_Encoder, Cam_Processor
-        self.pipe.dit.cam_processor = Cam_Processor(13, 25) # project the input dim to unified dim
-
-        dim = self.pipe.dit.blocks[0].self_attn.q.weight.shape[0]
-        for i, block in enumerate(self.pipe.dit.blocks):
-            # Add Camera Pose Encoder
-            block.cpe = Cam_Encoder(
-                unified_dim=25,
-                output_dim=dim
-            )
-
-    def add_framepack_components(self):
-        """🔧 Add FramePack components"""
-        if not hasattr(self.pipe.dit, 'clean_x_embedder'):
-            inner_dim = self.pipe.dit.blocks[0].self_attn.q.weight.shape[0]
-            
-            class CleanXEmbedder(nn.Module):
-                def __init__(self, inner_dim):
-                    super().__init__()
-                    self.proj = nn.Conv3d(16, inner_dim, kernel_size=(1, 2, 2), stride=(1, 2, 2))
-                    self.proj_2x = nn.Conv3d(16, inner_dim, kernel_size=(2, 4, 4), stride=(2, 4, 4))
-                    self.proj_4x = nn.Conv3d(16, inner_dim, kernel_size=(4, 8, 8), stride=(4, 8, 8))
-                
-                def forward(self, x, scale="1x"):
-                    if scale == "1x":
-                        return self.proj(x)
-                    elif scale == "2x":
-                        return self.proj_2x(x)
-                    elif scale == "4x":
-                        return self.proj_4x(x)
-                    else:
-                        raise ValueError(f"Unsupported scale: {scale}")
-            
-            self.pipe.dit.clean_x_embedder = CleanXEmbedder(inner_dim)
-            print("✅ Added FramePack clean_x_embedder component")
-        
-    def freeze_parameters(self):
-        self.pipe.requires_grad_(False)
-        self.pipe.eval()
-        self.pipe.denoising_model().train()
-
-    def training_step(self, batch, batch_idx):
-        """🔧 Multi-dataset training step"""
-        condition_frames = batch["condition_frames"][0].item()
-        target_frames = batch["target_frames"][0].item()
-        
-        dataset_name = batch.get("dataset_name", ["unknown"])[0]
-        dataset_type = batch.get("dataset_type", ["sekai"])[0]
-        
-        # Prepare inputs
-        latents = batch["latents"].to(self.device)
-        if len(latents.shape) == 4:
-            latents = latents.unsqueeze(0)
-        
-        clean_latents = batch["clean_latents"].to(self.device) if batch["clean_latents"].numel() > 0 else None
-        if clean_latents is not None and len(clean_latents.shape) == 4:
-            clean_latents = clean_latents.unsqueeze(0)
-        
-        clean_latents_2x = batch["clean_latents_2x"].to(self.device) if batch["clean_latents_2x"].numel() > 0 else None
-        if clean_latents_2x is not None and len(clean_latents_2x.shape) == 4:
-            clean_latents_2x = clean_latents_2x.unsqueeze(0)
-        
-        clean_latents_4x = batch["clean_latents_4x"].to(self.device) if batch["clean_latents_4x"].numel() > 0 else None
-        if clean_latents_4x is not None and len(clean_latents_4x.shape) == 4:
-            clean_latents_4x = clean_latents_4x.unsqueeze(0)
-        
-        latent_indices = batch["latent_indices"].to(self.device)
-        clean_latent_indices = batch["clean_latent_indices"].to(self.device) if batch["clean_latent_indices"].numel() > 0 else None
-        clean_latent_2x_indices = batch["clean_latent_2x_indices"].to(self.device) if batch["clean_latent_2x_indices"].numel() > 0 else None
-        clean_latent_4x_indices = batch["clean_latent_4x_indices"].to(self.device) if batch["clean_latent_4x_indices"].numel() > 0 else None
-        
-        cam_emb = batch["camera"].to(self.device)
-        
-        camera_dropout_prob = 0.05
-        if random.random() < camera_dropout_prob:
-            cam_emb = torch.zeros_like(cam_emb)
-            print(f"Applying camera dropout for CFG training (Dataset: {dataset_name}, Type: {dataset_type})")
-        
-        prompt_emb_batch = batch["prompt_emb"]
-        prompt_emb = {"context": prompt_emb_batch[0].to(self.device)}
-        image_emb = batch["image_emb"]
-
-        if "clip_feature" in image_emb:
-            image_emb["clip_feature"] = image_emb["clip_feature"][0].to(self.device)
-        if "y" in image_emb:
-            image_emb["y"] = image_emb["y"][0].to(self.device)
-
-        # Loss calculation
-        self.pipe.device = self.device
-        noise = torch.randn_like(latents)
-        timestep_id = torch.randint(0, self.pipe.scheduler.num_train_timesteps, (1,))
-        timestep = self.pipe.scheduler.timesteps[timestep_id].to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
-        
-        # FramePack noise handling
-        noisy_condition_latents = None
-        if clean_latents is not None:
-            noisy_condition_latents = copy.deepcopy(clean_latents)
-            if random.random() > 0.2:
-                noise_cond = torch.randn_like(clean_latents)
-                timestep_id_cond = torch.randint(0, self.pipe.scheduler.num_train_timesteps//4*3, (1,))
-                timestep_cond = self.pipe.scheduler.timesteps[timestep_id_cond].to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
-                noisy_condition_latents = self.pipe.scheduler.add_noise(clean_latents, noise_cond, timestep_cond)
-
-        extra_input = self.pipe.prepare_extra_input(latents)
-        noisy_latents = self.pipe.scheduler.add_noise(latents, noise, timestep)
-        training_target = self.pipe.scheduler.training_target(latents, noise, timestep)
-        
-        noise_pred, specialization_loss = self.pipe.denoising_model()(
-            noisy_latents, 
-            timestep=timestep, 
-            cam_emb=cam_emb,
-            latent_indices=latent_indices,
-            clean_latents=noisy_condition_latents if noisy_condition_latents is not None else clean_latents,
-            clean_latent_indices=clean_latent_indices,
-            clean_latents_2x=clean_latents_2x,
-            clean_latent_2x_indices=clean_latent_2x_indices,
-            clean_latents_4x=clean_latents_4x,
-            clean_latent_4x_indices=clean_latent_4x_indices,
-            **prompt_emb, 
-            **extra_input, 
-            **image_emb,
-            use_gradient_checkpointing=self.use_gradient_checkpointing,
-            use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload
-        )
-        
-        reconstruction_loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
-        reconstruction_loss = reconstruction_loss * self.pipe.scheduler.training_weight(timestep)
-    
-        total_loss = reconstruction_loss 
-        
-        print(f'\nLoss info (Step {self.global_step}):')
-        print(f'  - Diff loss: {reconstruction_loss.item():.6f}')
-        print(f'  - Total Loss: {total_loss.item():.6f}')
-        
-        return total_loss
-
-    def configure_optimizers(self):
-        trainable_modules = filter(lambda p: p.requires_grad, self.pipe.denoising_model().parameters())
-        optimizer = torch.optim.AdamW(trainable_modules, lr=self.learning_rate)
-        return optimizer
-    
- 
-def train_multi_dataset(args):
-    """Train model supporting multi-dataset"""
-    dataset_configs = [
-        {
-            'name': 'spatialvid',
-            'manifest': args.dataset_manifest,
-            'type': 'spatialvid',
-            'weight': 1.0
-        },
+    # 准备latents
+    latent_keys = [
+        ("latents", None), ("clean_latents", None),
+        ("clean_latents_2x", None), ("clean_latents_4x", None),
+        ("latent_indices", torch.long), ("clean_latent_indices", torch.long),
+        ("clean_latent_2x_indices", torch.long), ("clean_latent_4x_indices", torch.long)
     ]
     
-    dataset = MultiDatasetDynamicDataset(
-        dataset_configs,
+    framepack_pairs = {}
+    for key, dtype in latent_keys:
+        if key in batch:
+            value = batch[key][sample_index]
+            if "indices" in key:
+                framepack_pairs[key] = to_tensor(value, device, dtype, batch_dim=False)
+            else:
+                framepack_pairs[key] = to_tensor(value, device, model_dtype)
+    
+    # 准备文本和图像嵌入
+    prompt_text = batch["prompt_text"][sample_index]
+    context = batch["prompt_emb"]["context"][sample_index].to(device)
+    
+    image_emb = batch.get("image_emb", {})
+    image_tensor = None
+    if "clip_feature" in image_emb or "y" in image_emb:
+        image_tensor = image_emb.get("clip_feature", image_emb.get("y"))[sample_index].to(device)
+    
+    # 准备model_kwargs
+    model_kwargs = {k: v for k, v in framepack_pairs.items() if v is not None}
+    model_kwargs["context"] = context
+    if image_tensor is not None:
+        model_kwargs["image_emb"] = image_tensor
+    
+    # 准备ground truth extrinsics
+    gt_poses = batch.get("gt_absolute_poses", [None])[sample_index]
+    if gt_poses is None or not isinstance(gt_poses, list):
+        raise ValueError("Batch must contain 'gt_absolute_poses' as a list of tensors.")
+    gt_extrinsics_tensor = torch.stack(gt_poses, dim=0).to(device=device, dtype=torch.float32)
+    
+    conditioning = {
+        "cam_emb": cam_emb,
+        "modality_inputs": modality_inputs,
+        "model_kwargs": model_kwargs,
+    }
+    
+    return conditioning, gt_extrinsics_tensor, prompt_text
+
+def call_lyra_dit(
+    transformer,
+    latents,
+    timesteps,
+    context,
+    cam_emb=None,
+    model_kwargs=None,
+):
+    timestep_tensor = timesteps.to(latents.device, dtype=torch.float32)
+    forward_kwargs = {
+        "timestep": timestep_tensor,
+        "context": context,
+    }
+    if cam_emb is not None:
+        forward_kwargs["cam_emb"] = cam_emb
+    if model_kwargs:
+        for key, value in model_kwargs.items():
+            if value is None:
+                continue
+            if isinstance(value, torch.Tensor):
+                value = value.to(latents.device)
+            forward_kwargs[key] = value
+
+    outputs = transformer(latents, **forward_kwargs)
+
+    if isinstance(outputs, tuple):
+        return outputs[0]
+    return outputs
+
+def sd3_time_shift(shift, t):
+    return (shift * t) / (1 + (shift - 1) * t)
+
+def flux_step(
+    model_output: torch.Tensor,
+    latents: torch.Tensor,
+    eta: float,
+    sigmas: torch.Tensor,
+    index: int,
+    prev_sample: torch.Tensor,
+    grpo: bool,
+    sde_solver: bool,
+):
+    sigma = sigmas[index]
+    dsigma = sigmas[index + 1] - sigma
+    prev_sample_mean = latents + dsigma * model_output
+    pred_original_sample = latents - sigma * model_output
+    delta_t = sigma - sigmas[index + 1]
+    std_dev_t = eta * math.sqrt(delta_t)
+
+    if sde_solver:
+        score_estimate = -(latents-pred_original_sample*(1 - sigma))/sigma**2
+        log_term = -0.5 * eta**2 * score_estimate
+        prev_sample_mean = prev_sample_mean + log_term * dsigma
+
+    if grpo and prev_sample is None:
+        prev_sample = prev_sample_mean + torch.randn_like(prev_sample_mean) * std_dev_t
+
+    if grpo:
+        # log prob of prev_sample given prev_sample_mean and std_dev_t
+        log_prob = ((
+            -((prev_sample.detach().to(torch.float32) - prev_sample_mean.to(torch.float32)) ** 2) / (2 * (std_dev_t**2))
+        )
+        - math.log(std_dev_t)- torch.log(torch.sqrt(2 * torch.as_tensor(math.pi))))
+
+        # mean along all but batch dimension
+        log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
+        return prev_sample, pred_original_sample, log_prob
+    else:
+        return prev_sample_mean,pred_original_sample
+
+def assert_eq(x, y, msg=None):
+    assert x == y, f"{msg or 'Assertion failed'}: {x} != {y}"
+
+def run_sample_step(
+        args,
+        z,
+        progress_bar,
+        sigma_schedule,
+        transformer,
+        conditioning,
+        grpo_sample,
+    ):
+
+    if grpo_sample:
+        model_dtype = next(transformer.parameters()).dtype
+        model_kwargs = conditioning.get("model_kwargs", {})
+        context_raw = model_kwargs.get("context")
+        if context_raw is None:
+            raise ValueError("conditioning['model_kwargs'] must contain 'context'.")
+        context = context_raw.to(device=z.device, dtype=model_dtype)
+        cam_emb = conditioning.get("cam_emb")
+        if isinstance(cam_emb, torch.Tensor):
+            cam_emb = cam_emb.to(device=z.device, dtype=model_dtype)
+
+        prepared_model_kwargs = {}
+        def _prepare_value(value):
+            if value is None:
+                return None
+            if isinstance(value, torch.Tensor):
+                target_dtype = model_dtype if value.dtype.is_floating_point else value.dtype
+                return value.to(device=z.device, dtype=target_dtype)
+            if isinstance(value, dict):
+                return {k: _prepare_value(v) for k, v in value.items() if v is not None}
+            if isinstance(value, list):
+                return [_prepare_value(v) for v in value]
+            if isinstance(value, tuple):
+                return tuple(_prepare_value(v) for v in value)
+            return value
+
+        for key, value in model_kwargs.items():
+            if key == "context":
+                prepared_model_kwargs[key] = context
+            else:
+                prepared_model_kwargs[key] = _prepare_value(value)
+
+        forward_model_kwargs = {
+            k: v for k, v in prepared_model_kwargs.items() if k != "context"
+        }
+
+        all_latents = [z]
+        all_log_probs = []
+        for i in progress_bar:
+            sigma = sigma_schedule[i]
+            timestep_value = float(int(sigma * 1000))
+            timesteps = torch.full(
+                [z.shape[0]],
+                timestep_value,
+                device=z.device,
+                dtype=torch.float32,
+            )
+
+            transformer.eval()
+            with (
+                torch.autocast("cuda", torch.bfloat16)
+                if z.device.type == "cuda"
+                else nullcontext()
+            ):
+                pred = call_lyra_dit(
+                    transformer,
+                    z,
+                    timesteps,
+                    context,
+                    cam_emb=cam_emb,
+                    model_kwargs=forward_model_kwargs,
+                ).to(torch.float32)
+
+            z, pred_original, log_prob = flux_step(
+                pred.to(torch.float32),
+                z.to(torch.float32),
+                args.eta,
+                sigmas=sigma_schedule,
+                index=i,
+                prev_sample=None,
+                grpo=True,
+                sde_solver=True,
+            )
+            z = z.to(dtype=model_dtype)
+            all_latents.append(z)
+            all_log_probs.append(log_prob)
+        latents = pred_original
+        all_latents = torch.stack(all_latents, dim=1)
+        all_log_probs = torch.stack(all_log_probs, dim=1)
+        return z, latents, all_latents, all_log_probs
+
+        
+def grpo_one_step(
+            args,
+            latents,
+            pre_latents,
+            transformer,
+            timesteps,
+            step_index,
+            sigma_schedule,
+            conditioning,
+):
+    transformer.train()
+    model_dtype = next(transformer.parameters()).dtype
+
+    model_kwargs = conditioning.get("model_kwargs", {})
+    context_raw = model_kwargs.get("context")
+    if context_raw is None:
+        raise ValueError("conditioning['model_kwargs'] must contain 'context'.")
+    context = context_raw.to(device=latents.device, dtype=model_dtype)
+
+    cam_emb = conditioning.get("cam_emb")
+    if isinstance(cam_emb, torch.Tensor):
+        cam_emb = cam_emb.to(device=latents.device, dtype=model_dtype)
+
+    prepared_model_kwargs = {}
+    def _prepare_value(value):
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            target_dtype = model_dtype if value.dtype.is_floating_point else value.dtype
+            return value.to(device=latents.device, dtype=target_dtype)
+        if isinstance(value, dict):
+            return {k: _prepare_value(v) for k, v in value.items() if v is not None}
+        if isinstance(value, list):
+            return [_prepare_value(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(_prepare_value(v) for v in value)
+        return value
+
+    for key, value in model_kwargs.items():
+        if key == "context":
+            prepared_model_kwargs[key] = context
+        else:
+            prepared_model_kwargs[key] = _prepare_value(value)
+
+    forward_model_kwargs = {
+        k: v for k, v in prepared_model_kwargs.items() if k != "context"
+    }
+
+    with (
+        torch.autocast("cuda", torch.bfloat16)
+        if latents.device.type == "cuda"
+        else nullcontext()
+    ):
+        pred = call_lyra_dit(
+            transformer,
+            latents,
+            timesteps.to(torch.float32),
+            context,
+            cam_emb=cam_emb,
+            model_kwargs=forward_model_kwargs,
+        ).to(torch.float32)
+
+
+    z, pred_original, log_prob = flux_step(
+        pred.to(torch.float32),
+        latents.to(torch.float32),
+        args.eta,
+        sigma_schedule,
+        step_index,
+        prev_sample=pre_latents.to(torch.float32),
+        grpo=True,
+        sde_solver=True,
+    )
+    return log_prob
+
+def sample_reference_model(
+    args,
+    device, 
+    pipe,
+    batch, 
+    reward_model,
+    tokenizer,
+    preprocess_val,
+    train_step
+):
+    w, h, t = args.w, args.h, args.t
+    sample_steps = args.sampling_steps
+    sigma_schedule = torch.linspace(1, 0, args.sampling_steps + 1)
+
+    sigma_schedule = sd3_time_shift(args.shift, sigma_schedule)
+
+    _ = (tokenizer, preprocess_val)
+
+    assert_eq(
+        len(sigma_schedule),
+        sample_steps + 1,
+        "sigma_schedule must have length sample_steps + 1",
+    )
+
+    latents_batch = batch["latents"] # [train_batch_size * num_generatios, C, T, H, W]（use group）
+    if isinstance(latents_batch, torch.Tensor):
+        B = latents_batch.shape[0]
+    else:
+        B = len(latents_batch)
+
+    SPATIAL_DOWNSAMPLE = 8
+    TEMPORAL_DOWNSAMPLE = 4
+    IN_CHANNELS = 16
+    latent_t = (t - 1) // TEMPORAL_DOWNSAMPLE
+    latent_w, latent_h = w // SPATIAL_DOWNSAMPLE, h // SPATIAL_DOWNSAMPLE
+
+    batch_size = 1  
+    batch_indices = torch.chunk(torch.arange(B), max(B // batch_size, 1))
+
+    all_latents = []
+    all_log_probs = []
+    all_rewards = []  
+    model_dtype = next(pipe.dit.parameters()).dtype
+    conditioning_records = []
+
+    # 为每个样本初始化相同噪声
+    if args.init_same_noise:
+        input_latents = torch.randn(
+                (1, IN_CHANNELS, latent_t, latent_h, latent_w),  # (c,t,h,w)
+                device=device,
+                dtype=model_dtype,
+            )
+
+    # Sampling
+    for index, batch_idx in enumerate(batch_indices):
+        sample_index = batch_idx[0].item()
+        conditioning, gt_extrinsics, prompt_text = prepare_condition_for_sample(
+            batch, sample_index, device, model_dtype
+        )
+        conditioning_records.append({
+            "conditioning": conditioning,
+            "gt_extrinsics": gt_extrinsics,
+        })
+        
+        # 为每个样本的初始噪声加入微小扰动
+        if args.init_same_noise:
+            input_latents = input_latents + torch.randn_like(input_latents) * 0.02
+        
+        # 为每个样本初始化不同噪声
+        if not args.init_same_noise:
+            input_latents = torch.randn(
+                    (1, IN_CHANNELS, latent_t, latent_h, latent_w),  # (c,t,h,w)
+                    device=device,
+                    dtype=model_dtype,
+                )
+        
+        grpo_sample=True
+        progress_bar = tqdm(range(0, sample_steps), desc="Sampling Progress")
+        with torch.no_grad():
+            z, latents, batch_latents, batch_log_probs = run_sample_step(
+                args,
+                input_latents.clone(),
+                progress_bar,
+                sigma_schedule,
+                pipe.dit,
+                conditioning_records[-1]["conditioning"],
+                grpo_sample,
+            )
+            
+        all_latents.append(batch_latents)
+        all_log_probs.append(batch_log_probs)
+
+        rank = int(os.environ["RANK"])
+
+        video_output_path = f"{args.experiment_dir}/videos/wan_2_1_step_{train_step+1}_rank_{rank}_{index}.mp4"
+        conditioning_records[-1]["video_path"] = video_output_path
+        
+        with torch.inference_mode():
+            latents_to_decode = latents.to(dtype=torch.float32)
+            decoded_video = pipe.decode_video(latents_to_decode, tiled=True, tile_size=(34, 34), tile_stride=(18, 16))
+            video_np = decoded_video[0].to(torch.float32).permute(1, 2, 3, 0).cpu().numpy()
+            video_np = (video_np * 0.5 + 0.5).clip(0, 1)
+            video_np = (video_np * 255).astype(np.uint8)
+        try:
+            with imageio.get_writer(video_output_path, fps=24) as writer:
+                for frame in video_np:
+                    writer.append_data(frame)
+            print(f"\n 已导出视频到: {video_output_path}")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"在导出视频时发生错误；{e}")
+            
+        target_pose_output_path = f"{args.experiment_dir}/target_poses/wan_2_1_step_{train_step+1}_rank_{rank}_{index}.txt"
+        extract_target_poses_to_txt(conditioning["cam_emb"].squeeze(0), target_pose_output_path)
+
+        # Calculate 3D-Aware Reward
+        gt_extrinsics_tensor = conditioning_records[-1].get("gt_extrinsics")
+        if gt_extrinsics_tensor is None:
+            raise RuntimeError("Ground-truth extrinsics are required to compute the reward.")
+        gt_extrinsics_np = gt_extrinsics_tensor.detach().cpu().numpy()
+        reward_info = {}
+        try:
+            decoded_video = decoded_video.transpose(1, 2)
+            video_min = decoded_video.min()
+            video_max = decoded_video.max()
+            normalized_video = 2 * (decoded_video - video_min) / (video_max - video_min + 1e-8) - 1
+            #reward_info = reward_model.calculate_reward(normalized_video, gt_extrinsics_np)
+            reward_info = {
+                "total_reward": 0,
+                "rotation_reward": 0,
+                "translation_reward": 0,
+                "mean_rotation_error_degrees": 0,
+                "mean_translation_error": 0,
+                "translation_scale_factor": 0
+            }
+            
+            print("\n--- 对齐奖励结果 ---")
+            print(f"平均旋转误差: {reward_info['mean_rotation_error_degrees']:.2f} 度")
+            print(f"平均平移误差 (尺度对齐后): {reward_info['mean_translation_error']:.4f}")
+            print(f"计算出的轨迹尺度因子: {reward_info['translation_scale_factor']:.4f}")
+            print("-" * 20)
+            print(f"旋转奖励: {reward_info['rotation_reward']:.4f}")
+            print(f"平移奖励: {reward_info['translation_reward']:.4f}")
+            print(f"最终加权总奖励: {reward_info['total_reward']:.4f}")
+            print("----------------------\n")
+            
+            if args.save_all_rewards:
+                # 以JSON格式写入实验结果
+                json_output_path = target_pose_output_path.replace(f"_{index}.txt", "_reward.json")
+                reward_data = {
+                    "train_step": train_step + 1,
+                    "rank": rank,
+                    "sample_index": index,
+                    "mean_rotation_error_degrees": float(reward_info['mean_rotation_error_degrees']),
+                    "mean_translation_error": float(reward_info['mean_translation_error']),
+                    "translation_scale_factor": float(reward_info['translation_scale_factor']),
+                    "rotation_reward": float(reward_info['rotation_reward']),
+                    "translation_reward": float(reward_info['translation_reward']),
+                    "total_reward": float(reward_info['total_reward'])
+                }
+
+                # 读取已有数据或创建新列表
+                existing_data = []
+                if os.path.exists(json_output_path):
+                    with open(json_output_path, 'r', encoding='utf-8') as f:
+                        try:
+                            existing_data = json.load(f)
+                        except json.JSONDecodeError:
+                            existing_data = []
+
+                # 添加新数据并写入
+                existing_data.append(reward_data)
+                with open(json_output_path, 'w', encoding='utf-8') as f:
+                    json.dump(existing_data, f, ensure_ascii=False, indent=2)
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"在计算奖励时发生错误: {e}")
+
+        if not reward_info:
+            raise ValueError("reward_info calculation fault")
+        if isinstance(reward_info, dict):
+            total_reward_value = float(reward_info.get("total_reward", 0.0))
+        else:
+            total_reward_value = float(reward_info)
+            reward_info = {"total_reward": total_reward_value}
+
+        reward_tensor = torch.tensor([total_reward_value], device=device, dtype=torch.float32)
+        all_rewards.append(reward_tensor)
+        conditioning_records[-1]["reward_info"] = reward_info
+
+    all_latents = torch.cat(all_latents, dim=0)
+    all_log_probs = torch.cat(all_log_probs, dim=0)
+    if not all_rewards:
+        raise RuntimeError(
+            "No rewards were computed during sampling. Ensure CameraAlignmentReward returns a total_reward value."
+        )
+    all_rewards = torch.cat(all_rewards, dim=0)
+
+    return all_rewards, all_latents, all_log_probs, sigma_schedule, conditioning_records
+
+
+def gather_tensor(tensor):
+    if not dist.is_initialized():
+        return tensor
+    world_size = dist.get_world_size()
+    gathered_tensors = [torch.zeros_like(tensor) for _ in range(world_size)]
+    dist.all_gather(gathered_tensors, tensor)
+    return torch.cat(gathered_tensors, dim=0)
+
+def train_one_step(
+    args,
+    device,
+    pipe,
+    reward_model,
+    tokenizer,
+    optimizer,
+    lr_scheduler,
+    batch,
+    noise_scheduler,
+    max_grad_norm,
+    preprocess_val,
+    train_step,
+):
+
+    total_loss = 0.0
+    optimizer.zero_grad()
+    model_dtype = next(pipe.dit.parameters()).dtype
+    batch = to_device(batch, device, model_dtype)
+
+    if args.use_group:
+        # train_batch_size -> train_batch_size * num_generations
+        batch = repeat_for_group(batch, args.num_generations)
+
+    reward, all_latents, all_log_probs, sigma_schedule, conditioning_records = sample_reference_model(
+            args,
+            device,
+            pipe,
+            batch,
+            reward_model,
+            tokenizer,
+            preprocess_val,
+            train_step=train_step,
+        )
+    batch_size = all_latents.shape[0]
+    timestep_value = [int(sigma * 1000) for sigma in sigma_schedule][:args.sampling_steps]
+    timestep_values = [timestep_value[:] for _ in range(batch_size)]
+    device = all_latents.device
+    timesteps =  torch.tensor(timestep_values, device=all_latents.device, dtype=torch.long)
+
+    samples = {
+        "timesteps": timesteps.detach().clone()[:, :-1],
+        "latents": all_latents[
+            :, :-1
+        ][:, :-1],  # each entry is the latent before timestep t (exclude the last entry)
+        "next_latents": all_latents[
+            :, 1:
+        ][:, :-1],  # each entry is the latent after timestep t (exclude the first entry)
+        "log_probs": all_log_probs[:, :-1],
+        "rewards": reward.to(torch.float32),
+    }
+    gathered_reward = gather_tensor(samples["rewards"])
+    if dist.get_rank()==0:
+        print("gathered_reward", gathered_reward)
+        with open(f'{args.experiment_dir}/reward.txt', 'a') as f: 
+            f.write(f"{gathered_reward.mean().item()}\n")
+
+    #计算advantage
+    if args.use_group:
+        n = len(samples["rewards"]) // (args.num_generations)
+        advantages = torch.zeros_like(samples["rewards"])
+        
+        for i in range(n):
+            start_idx = i * args.num_generations
+            end_idx = (i + 1) * args.num_generations
+            group_rewards = samples["rewards"][start_idx:end_idx]
+            group_mean = group_rewards.mean()
+            group_std = group_rewards.std() + 1e-8
+            advantages[start_idx:end_idx] = (group_rewards - group_mean) / group_std
+        
+        samples["advantages"] = advantages
+    else:
+        advantages = (samples["rewards"] - gathered_reward.mean())/(gathered_reward.std()+1e-8)
+        samples["advantages"] = advantages
+
+    
+    perms = torch.stack(
+        [
+            torch.randperm(len(samples["timesteps"][0]))
+            for _ in range(batch_size)
+        ]
+    ).to(device) 
+    for key in ["timesteps", "latents", "next_latents", "log_probs"]:
+        samples[key] = samples[key][
+            torch.arange(batch_size).to(device) [:, None],
+            perms,
+        ]
+    samples_batched = {
+        k: v.unsqueeze(1)
+        for k, v in samples.items()
+    }
+    # dict of lists -> list of dicts for easier iteration
+    samples_batched_list = [
+        dict(zip(samples_batched, x)) for x in zip(*samples_batched.values())
+    ]
+    train_timesteps = int(len(samples["timesteps"][0])*args.timestep_fraction)
+    for i, sample in list(enumerate(samples_batched_list)):
+        conditioning = conditioning_records[i]["conditioning"]
+        for step_idx in range(train_timesteps):
+            clip_range = args.clip_range
+            adv_clip_max = args.adv_clip_max
+            new_log_probs = grpo_one_step(
+                args,
+                sample["latents"][:, step_idx],
+                sample["next_latents"][:, step_idx],
+                pipe.dit,
+                sample["timesteps"][:, step_idx],
+                perms[i][step_idx],
+                sigma_schedule,
+                conditioning,
+            )
+
+            advantages = torch.clamp(
+                sample["advantages"],
+                -adv_clip_max,
+                adv_clip_max,
+            )
+
+            ratio = torch.exp(new_log_probs - sample["log_probs"][:, step_idx])
+
+            unclipped_loss = -advantages * ratio
+            clipped_loss = -advantages * torch.clamp(
+                ratio,
+                1.0 - clip_range,
+                1.0 + clip_range,
+            )
+            loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss)) / (args.gradient_accumulation_steps * train_timesteps)
+
+            loss.backward()
+            avg_loss = loss.detach().clone()
+            dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
+            total_loss += avg_loss.item()
+        
+        if (i+1)%args.gradient_accumulation_steps==0:
+            grad_norm = torch.nn.utils.clip_grad_norm_(pipe.dit.parameters(), max_norm=max_grad_norm)
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
+        if dist.get_rank()%8==0:
+            print(f"第 {i} 个动作对目标函数的贡献:")
+            print("reward", sample["rewards"].item())
+            print("ratio", ratio)
+            print("advantage", sample["advantages"].item())
+            print("final loss", loss.item())
+        dist.barrier()
+    
+    return total_loss, grad_norm.item()
+
+
+def main(args):
+    torch.backends.cuda.matmul.allow_tf32 = True
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    if local_rank < torch.cuda.device_count():
+        torch.cuda.set_device(local_rank)
+    else:
+        raise ValueError(f"local_rank {local_rank} 超出可用GPU范围")
+
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    print(f"World Size: {world_size}, Rank: {rank}, Local Rank: {local_rank}")
+    dist.init_process_group("nccl")
+    torch.cuda.set_device(local_rank)
+    device_index = torch.cuda.current_device()
+    device = torch.device("cuda", device_index)
+    initialize_sequence_parallel_state(args.sp_size)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    experiment_dir = f"/mnt/data/louis_crq/DanceGRPO/dancegrpo_experiment_qwj_{timestamp}"
+    os.makedirs(experiment_dir, exist_ok=True)
+    sub_dirs = ["videos", "target_poses", "prompts","checkpoints"]
+    for sub_dir in sub_dirs:
+        os.makedirs(os.path.join(experiment_dir, sub_dir), exist_ok=True)    
+    args.experiment_dir = experiment_dir
+
+    # If passed along, set the training seed now. On GPU...
+    if args.seed is not None:
+        # TODO: t within the same seq parallel group should be the same. Noise should be different.
+        set_seed(args.seed + rank)
+    # We use different seeds for the noise generation in each process to ensure that the noise is different in a batch.
+
+    # Handle the repository creation
+    if rank <= 0 and args.output_dir is not None:
+        os.makedirs(args.output_dir, exist_ok=True)
+
+    # For mixed precision training we cast all non-trainable weigths to half-precision
+    # as these weights are only used for inference, keeping weights in full precision is not required
+    preprocess_val = None
+    processor = None
+    
+    main_print("--> Loading CameraAlignmentReward Model")
+    reward_model = CameraAlignmentReward(rank=rank, device=device)
+
+    replace_dit_model_in_manager()
+    
+    model_manager = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
+    model_manager.load_models([
+        "/mnt/data/louis_crq/models/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors",
+        "/mnt/data/louis_crq/models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
+        "/mnt/data/louis_crq/models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
+    ])
+    pipe = WanVideoAstraPipeline.from_model_manager(model_manager, device="cuda")
+
+    # Add Lyra's module
+    add_framepack_components(pipe.dit)
+    
+    from diffsynth.models.wan_video_dit_cam import Cam_Encoder, Cam_Processor
+    pipe.dit.cam_processor = Cam_Processor(13, 25) # project the input dim to unified dim
+    dim = pipe.dit.blocks[0].self_attn.q.weight.shape[0]
+    for i, block in enumerate(pipe.dit.blocks):
+        # Add Camera Pose Encoder
+        block.cpe = Cam_Encoder(
+            unified_dim=25,
+            output_dim=dim
+        )
+        block.projector = nn.Linear(dim, dim)
+        block.projector.weight = nn.Parameter(torch.eye(dim))
+        block.projector.bias = nn.Parameter(torch.zeros(dim))
+
+    # Adaptation for loading weight from Astra
+    dit_state_dict = torch.load(args.astra_ckpt_path, map_location="cpu")
+    key_parts_map = {
+        'sekai_processor': 'cam_processor',
+        'moe.experts.0': 'cpe.encoder'
+    }
+    keys_to_replace = []
+    for old_key in dit_state_dict.keys():
+        for old_key_parts in key_parts_map.keys():
+            if isinstance(old_key, str) and old_key_parts in old_key:
+                keys_to_replace.append(old_key)
+                
+    for old_key in keys_to_replace:
+        value = dit_state_dict[old_key]
+        for old_key_parts, new_key_parts in key_parts_map.items():
+            if old_key_parts in old_key:
+                new_key = old_key.replace(old_key_parts, new_key_parts)
+                del dit_state_dict[old_key]
+                dit_state_dict[new_key] = value
+    
+    pipe.dit.load_state_dict(dit_state_dict, strict=False)  # 使用strict=False以兼容新增的MoE组件
+    
+    pipe.dit.requires_grad_(False)
+    for name, module in pipe.dit.named_modules():
+        if any(keyword in name for keyword in ["cam_encoder", "projector", "clean_x_embedder", "cpe", "cam_processor"]):
+            for param in module.parameters():
+                param.requires_grad = True
+    
+    pipe = pipe.to(device)
+    model_dtype = next(pipe.dit.parameters()).dtype
+    
+    transformer = pipe.dit
+
+    if args.gradient_checkpointing:
+        apply_fsdp_checkpointing(
+            transformer, (DiTBlockWithMoE,), args.selective_checkpointing
+        )
+
+    main_print(
+        f"--> Initializing FSDP with sharding strategy: {args.fsdp_sharding_startegy}"
+    )
+    # Load the reference model
+    main_print(f"--> model loaded")
+
+    # Set model as trainable.
+    transformer.train()
+
+    noise_scheduler = None
+
+    params_to_optimize = transformer.parameters()
+    params_to_optimize = list(filter(lambda p: p.requires_grad, params_to_optimize))
+    
+    trainable_params = []
+    total_params = 0
+
+    for name, param in transformer.named_parameters():
+        total_params += param.numel()
+        if param.requires_grad:
+            trainable_params.append((name, param.numel()))
+
+    print("Trainable parameters by module:")
+
+    num_trainable = sum(c for _, c in trainable_params)
+    print(f"\nTotal trainable parameters: {num_trainable:,}")
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable ratio: {100 * num_trainable / total_params:.2f}%")
+
+    optimizer = torch.optim.AdamW(
+        params_to_optimize,
+        lr=args.learning_rate,
+        betas=(0.9, 0.999),
+        weight_decay=args.weight_decay,
+        eps=1e-8,
+    )
+
+    init_steps = 0
+    main_print(f"optimizer: {optimizer}")
+
+    lr_scheduler = get_scheduler(
+        args.lr_scheduler,
+        optimizer=optimizer,
+        num_warmup_steps=args.lr_warmup_steps,
+        num_training_steps=1000000,
+        num_cycles=args.lr_num_cycles,
+        power=args.lr_power,
+        last_epoch=init_steps - 1,
+    )
+    
+    train_dataset = SpatialVidFramePackDataset(
+        args.dataset_path,
+        video_info_path="/mnt/data/louis_crq/data/preprocess_data/SpatialVID-HQ/manifest25.json",
         steps_per_epoch=args.steps_per_epoch,
         min_condition_frames=args.min_condition_frames,
         max_condition_frames=args.max_condition_frames,
         target_frames=args.target_frames,
     )
-    
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        shuffle=True,
-        batch_size=1,
-        num_workers=args.dataloader_num_workers
-    )
-    
-    model = MultiDatasetLightningModelForTrain(
-        dit_path=args.dit_path,
-        learning_rate=args.learning_rate,
-        use_gradient_checkpointing=args.use_gradient_checkpointing,
-        use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
-        resume_ckpt_path=args.resume_ckpt_path,
+    sampler = DistributedSampler(
+            train_dataset, rank=rank, num_replicas=world_size, shuffle=True, seed=args.sampler_seed
     )
 
-    trainer = pl.Trainer(
-        max_epochs=args.max_epochs,
-        accelerator="gpu",
-        devices="auto",
-        precision="bf16",
-        strategy=args.training_strategy,
-        default_root_dir=args.output_path,
-        accumulate_grad_batches=args.accumulate_grad_batches,
-        logger=False
+
+    train_dataloader = DataLoader(
+        train_dataset,
+        sampler=sampler,
+        collate_fn=framepack_collate_fn,
+        pin_memory=True,
+        batch_size=args.train_batch_size,
+        num_workers=args.dataloader_num_workers,
+        drop_last=True,
     )
-    trainer.fit(model, dataloader)
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Train Multi-Dataset FramePack with Cam_Encoder")
-    #parser.add_argument("--dit_path", type=str, default='./models/Wan-AI/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors')
-    parser.add_argument("--dit_path", type=str, default='/share_zhuyixuan05/zhuyixuan05/models--Wan-AI--Wan2.1-T2V-1.3B/snapshots/37ec512624d61f7aa208f7ea8140a131f93afc9a/diffusion_pytorch_model.safetensors')
-    parser.add_argument("--output_path", type=str, default="./")
-    parser.add_argument("--learning_rate", type=float, default=1e-5)
-    parser.add_argument("--steps_per_epoch", type=int, default=20000)
-    parser.add_argument("--max_epochs", type=int, default=100000)
-
-    parser.add_argument("--dataset_manifest", type=str, default='/share_zhuyixuan05/zhuyixuan05/SpatialVID_Wan21/manifest.json', help="json file of datasets")
-    parser.add_argument("--min_condition_frames", type=int, default=8, help="Min condition frames")
-    parser.add_argument("--max_condition_frames", type=int, default=120, help="Max condition frames")
-    parser.add_argument("--target_frames", type=int, default=32, help="Target frames")
-    parser.add_argument("--dataloader_num_workers", type=int, default=4)
-    parser.add_argument("--accumulate_grad_batches", type=int, default=1)
-    parser.add_argument("--training_strategy", type=str, default="ddp_find_unused_parameters_true")
-    parser.add_argument("--use_gradient_checkpointing", default=False)
-    parser.add_argument("--use_gradient_checkpointing_offload", action="store_true")
-    parser.add_argument("--resume_ckpt_path", type=str, default=None)
     
-    parser.add_argument("--unified_dim", type=int, default=25, help="Unified intermediate dimension")
+    #vae.enable_tiling()
+
+    if rank <= 0:
+        project = "wan_2_1"
+        wandb.init(project=project, config=args)
+
+    # Train!
+    total_batch_size = (
+        world_size
+        * args.gradient_accumulation_steps
+        / args.sp_size
+        * args.train_sp_batch_size
+    )
+    main_print("***** Running training *****")
+    main_print(f"  Num examples = {len(train_dataset)}")
+    main_print(f"  Dataloader size = {len(train_dataloader)}")
+    main_print(f"  Resume training from step {init_steps}")
+    main_print(f"  Instantaneous batch size per device = {args.train_batch_size}")
+    main_print(
+        f"  Total train batch size (w. data & sequence parallel, accumulation) = {total_batch_size}"
+    )
+    main_print(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+    main_print(f"  Total optimization steps per epoch = {args.max_train_steps}")
+    main_print(
+        f"  Total training parameters per FSDP shard = {sum(p.numel() for p in transformer.parameters() if p.requires_grad) / 1e9} B"
+    )
+    # print dtype
+    main_print(f"  Master weight dtype: {transformer.parameters().__next__().dtype}")
+
+    # Potentially load in the weights and states from a previous save
+    if args.resume_from_checkpoint:
+        assert NotImplementedError("resume_from_checkpoint is not supported now.")
+        # TODO
+
+    progress_bar = tqdm(
+        range(0, 100000),
+        initial=init_steps,
+        desc="Steps",
+        # Only show the progress bar once on each machine.
+        disable=local_rank > 0,
+    )
+
+
+    step_times = deque(maxlen=100)
+
+    # The number of epochs 1 is a random value; you can also set the number of epochs to be two.
+    for epoch in range(1):
+        if isinstance(sampler, DistributedSampler):
+            sampler.set_epoch(epoch) # Crucial for distributed shuffling per epoch       
+        for step, batch in enumerate(train_dataloader):
+            start_time = time.time()
+            if (step-1) % args.checkpointing_steps == 0 and step != 1:
+                cpu_state = transformer.state_dict()
+                if rank <= 0:
+                    save_dir = os.path.join(f"{args.experiment_dir}/checkpoints")
+                    os.makedirs(save_dir, exist_ok=True)
+                    weight_path = os.path.join(save_dir,
+                                            f"checkpoint_{step}_{epoch}.ckpt")
+                    torch.save(cpu_state, weight_path)
+                    main_print(f"--> checkpoint saved at step {step}: {save_dir}")
+                dist.barrier()
+            if step > args.max_train_steps:
+                break
+            loss, grad_norm = train_one_step(
+                args,
+                device, 
+                pipe,
+                reward_model,
+                processor,
+                optimizer,
+                lr_scheduler,
+                batch,
+                noise_scheduler,
+                args.max_grad_norm,
+                preprocess_val,
+                train_step=step
+            )
+
     
+            step_time = time.time() - start_time
+            step_times.append(step_time)
+            avg_step_time = sum(step_times) / len(step_times)
+    
+            progress_bar.set_postfix(
+                {
+                    "loss": f"{loss:.4f}",
+                    "step_time": f"{step_time:.2f}s",
+                    "grad_norm": grad_norm,
+                }
+            )
+            progress_bar.update(1)
+            if rank <= 0:
+                wandb.log(
+                    {
+                        "train_loss": loss,
+                        "learning_rate": lr_scheduler.get_last_lr()[0],
+                        "step_time": step_time,
+                        "avg_step_time": avg_step_time,
+                        "grad_norm": grad_norm,
+                    },
+                    step=step,
+                )
+
+    if get_sequence_parallel_state():
+        destroy_sequence_parallel_group()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    # dataset & dataloader
+    parser.add_argument(
+        "--dataset_path",
+        type=str,
+        default="/share_zhuyixuan05/zhuyixuan05/spatialvid",
+        help="Path to the dataset.",
+    )
+    parser.add_argument(
+        "--dataloader_num_workers",
+        type=int,
+        default=10,
+        help="Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process.",
+    )
+    parser.add_argument(
+        "--save_all_rewards",
+        action='store_true',
+        default=False,
+        help="缓存每个样本的reward"
+    )
+    
+    # text encoder & vae & diffusion model
+    parser.add_argument(
+        "--astra_ckpt_path",
+        type=str,
+        default="checkpoints/our_model.ckpt",
+        help="Path to save our model checkpoints.",
+    )
+    parser.add_argument("--cache_dir", type=str, default="./cache_dir")
+
+    # diffusion setting
+    parser.add_argument("--ema_decay", type=float, default=0.995)
+    parser.add_argument("--ema_start_step", type=int, default=0)
+    parser.add_argument("--cfg", type=float, default=0.0)
+
+    # validation & logs
+    parser.add_argument(
+        "--seed", type=int, default=42, help="A seed for reproducible training."
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="/mnt/data/louis_crq/DanceGRPO/data/outputs/grpo",
+        help="The output directory where the model predictions and checkpoints will be written.",
+    )
+    parser.add_argument(
+        "--checkpointing_steps",
+        type=int,
+        default=500,
+        help=(
+            "Save a checkpoint of the training state every X updates. These checkpoints can be used both as final"
+            " checkpoints in case they are better than the last checkpoint, and are also suitable for resuming"
+            " training using `--resume_from_checkpoint`."
+        ),
+    )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Whether training should be resumed from a previous checkpoint. Use a path saved by"
+            ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
+        ),
+    )
+    parser.add_argument(
+        "--logging_dir",
+        type=str,
+        default="logs",
+        help=(
+            "[TensorBoard](https://www.tensorflow.org/tensorboard) log directory. Will default to"
+            " *output_dir/runs/**CURRENT_DATETIME_HOSTNAME***."
+        ),
+    )
+
+    # optimizer & scheduler & Training
+    parser.add_argument(
+        "--max_train_steps",
+        type=int,
+        default=None,
+        help="Total number of training steps to perform.  If provided, overrides num_train_epochs.",
+    )
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=1,
+        help="Number of updates steps to accumulate before performing a backward/update pass.",
+    )
+    parser.add_argument(
+        "--learning_rate",
+        type=float,
+        default=1e-4,
+        help="Initial learning rate (after the potential warmup period) to use.",
+    )
+    parser.add_argument(
+        "--lr_warmup_steps",
+        type=int,
+        default=10,
+        help="Number of steps for the warmup in the lr scheduler.",
+    )
+    parser.add_argument(
+        "--max_grad_norm", default=2.0, type=float, help="Max gradient norm."
+    )
+    parser.add_argument(
+        "--gradient_checkpointing",
+        action="store_true",
+        help="Whether or not to use gradient checkpointing to save memory at the expense of slower backward pass.",
+    )
+    parser.add_argument("--selective_checkpointing", type=float, default=1.0)
+    parser.add_argument(
+        "--allow_tf32",
+        action="store_true",
+        help=(
+            "Whether or not to allow TF32 on Ampere GPUs. Can be used to speed up training. For more information, see"
+            " https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices"
+        ),
+    )
+    parser.add_argument(
+        "--mixed_precision",
+        type=str,
+        default="bf16",
+        choices=["no", "fp16", "bf16"],
+        help=(
+            "Whether to use mixed precision. Choose between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >="
+            " 1.10.and an Nvidia Ampere GPU.  Default to the value of accelerate config of the current system or the"
+            " flag passed with the `accelerate.launch` command. Use this argument to override the accelerate config."
+        ),
+    )
+    parser.add_argument(
+        "--use_cpu_offload",
+        action="store_true",
+        help="Whether to use CPU offload for param & gradient & optimizer states.",
+    )
+
+    parser.add_argument(
+        "--train_batch_size",
+        type=int,
+        default=16,
+        help="Batch size (per device) for the training dataloader.",
+    )
+    parser.add_argument("--sp_size", type=int, default=1, help="For sequence parallel")
+    parser.add_argument(
+        "--train_sp_batch_size",
+        type=int,
+        default=1,
+        help="Batch size for sequence parallel training",
+    )
+
+    parser.add_argument("--fsdp_sharding_startegy", default="full")
+
+    # lr_scheduler
+    parser.add_argument(
+        "--lr_scheduler",
+        type=str,
+        default="constant_with_warmup",
+        help=(
+            'The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial",'
+            ' "constant", "constant_with_warmup"]'
+        ),
+    )
+    parser.add_argument(
+        "--lr_num_cycles",
+        type=int,
+        default=1,
+        help="Number of cycles in the learning rate scheduler.",
+    )
+    parser.add_argument(
+        "--lr_power",
+        type=float,
+        default=1.0,
+        help="Power factor of the polynomial scheduler.",
+    )
+    parser.add_argument(
+        "--weight_decay", type=float, default=0.01, help="Weight decay to apply."
+    )
+    parser.add_argument(
+        "--master_weight_type",
+        type=str,
+        default="fp32",
+        help="Weight type to use - fp32 or bf16.",
+    )
+
+    #GRPO training
+    parser.add_argument(
+        "--h",
+        type=int,
+        default=None,   
+        help="video height",
+    )
+    parser.add_argument(
+        "--w",
+        type=int,
+        default=None,   
+        help="video width",
+    )
+    parser.add_argument(
+        "--t",
+        type=int,
+        default=None,   
+        help="video length",
+    )
+    parser.add_argument(
+        "--eta",
+        type=float,
+        default=None,   
+        help="noise eta",
+    )
+    parser.add_argument(
+        "--sampling_steps",
+        type=int,
+        default=None,   
+        help="sampling steps",
+    )
+    parser.add_argument(
+        "--sampler_seed",
+        type=int,
+        default=None,   
+        help="seed of sampler",
+    )
+    parser.add_argument(
+        "--loss_coef",
+        type=float,
+        default=1.0,   
+        help="the global loss should be divided by",
+    )
+    parser.add_argument(
+        "--use_group",
+        action="store_true",
+        default=False,
+        help="whether compute advantages for each prompt",
+    )
+    parser.add_argument(
+        "--num_generations",
+        type=int,
+        default=16,   
+        help="num_generations per prompt",
+    )
+    parser.add_argument(
+        "--ignore_last",
+        action="store_true",
+        default=False,
+        help="whether ignore last step of mdp",
+    )
+    parser.add_argument(
+        "--init_same_noise",
+        action="store_true",
+        default=False,
+        help="whether use the same noise within each prompt",
+    )
+    parser.add_argument(
+        "--shift",
+        type = float,
+        default=1.0,
+        help="shift for timestep scheduler",
+    )
+    parser.add_argument(
+        "--timestep_fraction",
+        type = float,
+        default=1.0,
+        help="timestep downsample ratio",
+    )
+    parser.add_argument(
+        "--clip_range",
+        type = float,
+        default=1e-4,
+        help="clip range for grpo",
+    )
+    parser.add_argument(
+        "--adv_clip_max",
+        type = float,
+        default=5.0,
+        help="clipping advantage",
+    )
+    parser.add_argument(
+        "--cfg_infer",
+        type = float,
+        default=5.0,
+        help="cfg for training",
+    )
+    
+    # Train our model
+    parser.add_argument(
+        "--moe_hidden_dim",
+        type=int,
+        default=128,
+        help="Hidden dimension for MoE.",
+    )
+    parser.add_argument(
+        "--steps_per_epoch", 
+        type=int, 
+        default=200000
+    )
+    parser.add_argument(
+        "--max_epochs", 
+        type=int, 
+        default=100000
+    )
+    parser.add_argument(
+        "--min_condition_frames", 
+        type=int, 
+        default=8, 
+        help="最小条件帧数"
+    )
+    parser.add_argument(
+        "--max_condition_frames", 
+        type=int, 
+        default=120, 
+        help="最大条件帧数"
+    )
+    parser.add_argument(
+        "--target_frames", 
+        type=int, 
+        default=32, 
+        help="目标帧数"
+    )
+
     args = parser.parse_args()
-    
-    print("🔧 Multi-dataset CPE Training Config:")
-    print(f"  - Model: wan_video_dit_cam.py")
-    print(f"  - Unified Dim: {args.unified_dim}")
-    
-    train_multi_dataset(args)
+    main(args)

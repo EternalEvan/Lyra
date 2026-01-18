@@ -15,7 +15,7 @@ export WANDB_MODE=online
 # cd ..
 
 CUDA_VISIBLE_DEVICES=0 NCCL_NVLS_ENABLE=0 torchrun --nproc_per_node=1 --master_port 19003 \
-    fastvideo/train_grpo_astra.py \
+    finetune/train_grpo_astra.py \
     --seed 42 \
     --pretrained_model_name_or_path /home/zhuyixuan05/ReCamMaster/models/Wan-AI/Wan2.1-T2V-1.3B \
     --vae_model_path /home/zhuyixuan05/ReCamMaster/models/Wan-AI/Wan2.1-T2V-1.3B \
