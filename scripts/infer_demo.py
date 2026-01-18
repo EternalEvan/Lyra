@@ -169,7 +169,7 @@ def compute_relative_pose(pose_a, pose_b, use_torch=False):
     return relative_pose
 
 
-def replace_dit_model_in_manager_cam():
+def replace_dit_model_in_manager():
     """Replace DiT model class with camera version"""
     from diffsynth.models.wan_video_dit_cam import WanModelCam
     from diffsynth.configs.model_config import model_loader_configs
@@ -462,7 +462,7 @@ def inference_framepack_sliding_window(
     print(f"- Text guidance scale: {text_guidance_scale}")
     
     # 1. Model initialization
-    replace_dit_model_in_manager_cam()
+    replace_dit_model_in_manager()
 
     model_manager = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
     model_manager.load_models([

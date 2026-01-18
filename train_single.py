@@ -1,4 +1,4 @@
-# MoE training for fused nuscenes and sekai datasets
+# CPE training for fused nuscenes and sekai datasets
 import torch
 import torch.nn as nn
 import lightning as pl
@@ -734,26 +734,25 @@ class MultiDatasetDynamicDataset(torch.utils.data.Dataset):
         return self.steps_per_epoch
 
 def replace_dit_model_in_manager():
-    """Replace DiT model class with MoE version before loading models"""
-    from diffsynth.models.wan_video_dit_moe import WanModelMoe
+    """Replace DiT model class with camera version"""
+    from diffsynth.models.wan_video_dit_cam import WanModelCam
     from diffsynth.configs.model_config import model_loader_configs
-    
+
     for i, config in enumerate(model_loader_configs):
         keys_hash, keys_hash_with_shape, model_names, model_classes, model_resource = config
-        
+
         if 'wan_video_dit' in model_names:
             new_model_names = []
             new_model_classes = []
-            
+
             for name, cls in zip(model_names, model_classes):
                 if name == 'wan_video_dit':
                     new_model_names.append(name)
-                    new_model_classes.append(WanModelMoe)  # 🔧 Use MoE version
-                    print(f"✅ Replaced model class: {name} -> WanModelMoe")
+                    new_model_classes.append(WanModelCam)
                 else:
                     new_model_names.append(name)
                     new_model_classes.append(cls)
-            
+
             model_loader_configs[i] = (keys_hash, keys_hash_with_shape, new_model_names, new_model_classes, model_resource)
 
 class MultiDatasetLightningModelForTrain(pl.LightningModule):
@@ -764,13 +763,8 @@ class MultiDatasetLightningModelForTrain(pl.LightningModule):
         use_gradient_checkpointing=True,
         use_gradient_checkpointing_offload=False,
         resume_ckpt_path=None,
-        # 🔧 MoE Params
-        use_moe=False,
-        moe_config=None
     ):
         super().__init__()
-        self.use_moe = use_moe
-        self.moe_config = moe_config or {}
         
         replace_dit_model_in_manager()
         model_manager = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
@@ -781,20 +775,21 @@ class MultiDatasetLightningModelForTrain(pl.LightningModule):
             dit_path = dit_path.split(",")
             model_manager.load_models([dit_path])
         
-        model_manager.load_models(["./models/Wan-AI/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth"])
+        #model_manager.load_models(["./models/Wan-AI/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth"])
+        model_manager.load_models(["/share_zhuyixuan05/zhuyixuan05/models--Wan-AI--Wan2.1-T2V-1.3B/snapshots/37ec512624d61f7aa208f7ea8140a131f93afc9a/Wan2.1_VAE.pth"])
         
         self.pipe = WanVideoAstraPipeline.from_model_manager(model_manager)
         self.pipe.scheduler.set_timesteps(1000, training=True)
 
-        # Add FramePack components
+        # 🔧 Add FramePack components
         self.add_framepack_components()
-        if self.use_moe:
-            self.add_moe_components()
-
-        # 🔧 Add camera encoder (wan_video_dit_moe.py handles MoE logic)
+        
+        # 🔧 Add Camera Pose Encoder
+        self.add_cpe_components()
+        
         dim = self.pipe.dit.blocks[0].self_attn.q.weight.shape[0]
         for block in self.pipe.dit.blocks:
-            # 🔧 Simplified: Only add standard camera encoder, MoE logic is in wan_video_dit_moe.py
+            # 🔧 Simplified: Only add standard camera encoder
             block.cam_encoder = nn.Linear(13, dim)
             block.projector = nn.Linear(dim, dim)
             block.cam_encoder.weight.data.zero_()
@@ -813,8 +808,7 @@ class MultiDatasetLightningModelForTrain(pl.LightningModule):
         
         # 🔧 Set trainable parameters
         for name, module in self.pipe.denoising_model().named_modules():
-            if any(keyword in name for keyword in ["cam_encoder", "projector", "self_attn", "clean_x_embedder", 
-                                                "moe", "sekai_processor", "nuscenes_processor","openx_processor"]):
+            if any(keyword in name for keyword in ["cam_encoder", "projector", "self_attn", "clean_x_embedder", "cpe", "cam_processor"]):
                 for param in module.parameters():
                     param.requires_grad = True
         
@@ -824,31 +818,18 @@ class MultiDatasetLightningModelForTrain(pl.LightningModule):
         
         os.makedirs("multi_dataset_dynamic/visualizations", exist_ok=True)
 
-    def add_moe_components(self):
-        """🔧 Add MoE components - Simplified version, mod processors created in WanModelMoe"""
-        if not hasattr(self.pipe.dit, 'moe_config'):
-            self.pipe.dit.moe_config = self.moe_config
-            print("✅ Added MoE config to model")
-        self.pipe.dit.top_k = self.moe_config.get("top_k", 1)
-        
+    def add_cpe_components(self):
+        '''🔧 Add Camera Pose Encoder components'''
+        from diffsynth.models.wan_video_dit_cam import Cam_Encoder, Cam_Processor
+        self.pipe.dit.cam_processor = Cam_Processor(13, 25) # project the input dim to unified dim
+
         dim = self.pipe.dit.blocks[0].self_attn.q.weight.shape[0]
-        unified_dim = self.moe_config.get("unified_dim", 30)
-        num_experts = self.moe_config.get("num_experts", 4)
-        from diffsynth.models.wan_video_dit_moe import MultiModalMoE, ModalityProcessor
-
-        self.pipe.dit.sekai_processor = ModalityProcessor("sekai", 13, unified_dim)
-        self.pipe.dit.nuscenes_processor = ModalityProcessor("nuscenes", 8, unified_dim)
-        self.pipe.dit.openx_processor = ModalityProcessor("openx", 13, unified_dim)
-        self.pipe.dit.global_router = nn.Linear(unified_dim, num_experts)
-
-        for i, block in enumerate(self.pipe.dit.blocks):            
-            block.moe = MultiModalMoE(
-                unified_dim=unified_dim,
-                output_dim=dim,
-                num_experts=self.moe_config.get("num_experts", 4),
-                top_k=self.moe_config.get("top_k", 2)
+        for i, block in enumerate(self.pipe.dit.blocks):
+            # Add Camera Pose Encoder
+            block.cpe = Cam_Encoder(
+                unified_dim=25,
+                output_dim=dim
             )
-            print(f"✅ Block {i} added MoE component (unified_dim: {unified_dim}, experts: {self.moe_config.get('num_experts', 4)})")
 
     def add_framepack_components(self):
         """🔧 Add FramePack components"""
@@ -912,23 +893,9 @@ class MultiDatasetLightningModelForTrain(pl.LightningModule):
         
         cam_emb = batch["camera"].to(self.device)
         
-        # 🔧 Set modality inputs based on dataset type
-        if dataset_type == "sekai":
-            modality_inputs = {"sekai": cam_emb}
-        elif dataset_type == "spatialvid":  
-            modality_inputs = {"sekai": cam_emb}  # Uses sekai processor
-        elif dataset_type == "nuscenes":
-            modality_inputs = {"nuscenes": cam_emb}
-        elif dataset_type == "openx":  
-            modality_inputs = {"openx": cam_emb}
-        else:
-            modality_inputs = {"sekai": cam_emb}
-        
         camera_dropout_prob = 0.05
         if random.random() < camera_dropout_prob:
             cam_emb = torch.zeros_like(cam_emb)
-            for key in modality_inputs:
-                modality_inputs[key] = torch.zeros_like(modality_inputs[key])
             print(f"Applying camera dropout for CFG training (Dataset: {dataset_name}, Type: {dataset_type})")
         
         prompt_emb_batch = batch["prompt_emb"]
@@ -964,7 +931,6 @@ class MultiDatasetLightningModelForTrain(pl.LightningModule):
             noisy_latents, 
             timestep=timestep, 
             cam_emb=cam_emb,
-            modality_inputs=modality_inputs,
             latent_indices=latent_indices,
             clean_latents=noisy_condition_latents if noisy_condition_latents is not None else clean_latents,
             clean_latent_indices=clean_latent_indices,
@@ -981,20 +947,13 @@ class MultiDatasetLightningModelForTrain(pl.LightningModule):
         
         reconstruction_loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
         reconstruction_loss = reconstruction_loss * self.pipe.scheduler.training_weight(timestep)
-        
-        # specialization_loss_weight = self.moe_config.get("moe_loss_weight", 0.1)
-        total_loss = reconstruction_loss #+ specialization_loss_weight * specialization_loss
+    
+        total_loss = reconstruction_loss 
         
         print(f'\nLoss info (Step {self.global_step}):')
         print(f'  - Diff loss: {reconstruction_loss.item():.6f}')
-        # print(f'  - MoE specification loss: {specialization_loss.item():.6f}')
-        # print(f'  - Expert loss weight: {specialization_loss_weight}')
         print(f'  - Total Loss: {total_loss.item():.6f}')
         
-        modality_to_expert = {"sekai": 0, "nuscenes": 1, "openx": 2}
-        expected_expert = modality_to_expert.get(dataset_type, 0)
-        print(f'  - Current modality: {dataset_type} -> Expected expert: {expected_expert}')
-
         return total_loss
 
     def configure_optimizers(self):
@@ -1004,7 +963,7 @@ class MultiDatasetLightningModelForTrain(pl.LightningModule):
     
  
 def train_multi_dataset(args):
-    """Train model supporting multi-dataset MoE"""
+    """Train model supporting multi-dataset"""
     dataset_configs = [
         {
             'name': 'spatialvid',
@@ -1029,24 +988,12 @@ def train_multi_dataset(args):
         num_workers=args.dataloader_num_workers
     )
     
-    moe_config = {
-        "unified_dim": args.unified_dim,
-        "num_experts": args.moe_num_experts,
-        "top_k": args.moe_top_k,
-        "moe_loss_weight": args.moe_loss_weight,
-        "sekai_input_dim": 13,
-        "nuscenes_input_dim": 8,
-        "openx_input_dim": 13  
-    }
-    
     model = MultiDatasetLightningModelForTrain(
         dit_path=args.dit_path,
         learning_rate=args.learning_rate,
         use_gradient_checkpointing=args.use_gradient_checkpointing,
         use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
         resume_ckpt_path=args.resume_ckpt_path,
-        use_moe=True,
-        moe_config=moe_config
     )
 
     trainer = pl.Trainer(
@@ -1062,14 +1009,15 @@ def train_multi_dataset(args):
     trainer.fit(model, dataloader)
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Train Multi-Dataset FramePack with MoE")
-    parser.add_argument("--dit_path", type=str, default='./models/Wan-AI/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors')
+    parser = argparse.ArgumentParser(description="Train Multi-Dataset FramePack with Cam_Encoder")
+    #parser.add_argument("--dit_path", type=str, default='./models/Wan-AI/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors')
+    parser.add_argument("--dit_path", type=str, default='/share_zhuyixuan05/zhuyixuan05/models--Wan-AI--Wan2.1-T2V-1.3B/snapshots/37ec512624d61f7aa208f7ea8140a131f93afc9a/diffusion_pytorch_model.safetensors')
     parser.add_argument("--output_path", type=str, default="./")
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--steps_per_epoch", type=int, default=20000)
     parser.add_argument("--max_epochs", type=int, default=100000)
 
-    parser.add_argument("--dataset_manifest", type=str, default='/mnt/preprocessed_data/SpatialVID_Wan21/manifest.json', help="json file of datasets")
+    parser.add_argument("--dataset_manifest", type=str, default='/share_zhuyixuan05/zhuyixuan05/SpatialVID_Wan21/manifest.json', help="json file of datasets")
     parser.add_argument("--min_condition_frames", type=int, default=8, help="Min condition frames")
     parser.add_argument("--max_condition_frames", type=int, default=120, help="Max condition frames")
     parser.add_argument("--target_frames", type=int, default=32, help="Target frames")
@@ -1080,19 +1028,12 @@ if __name__ == '__main__':
     parser.add_argument("--use_gradient_checkpointing_offload", action="store_true")
     parser.add_argument("--resume_ckpt_path", type=str, default=None)
     
-    # MoE Params
     parser.add_argument("--unified_dim", type=int, default=25, help="Unified intermediate dimension")
-    parser.add_argument("--moe_num_experts", type=int, default=3, help="Number of experts")
-    parser.add_argument("--moe_top_k", type=int, default=1, help="Top-K experts")
-    parser.add_argument("--moe_loss_weight", type=float, default=0.1, help="MoE loss weight")
     
     args = parser.parse_args()
     
-    print("🔧 Multi-dataset MoE Training Config:")
-    print(f"  - Model: wan_video_dit_moe.py")
+    print("🔧 Multi-dataset CPE Training Config:")
+    print(f"  - Model: wan_video_dit_cam.py")
     print(f"  - Unified Dim: {args.unified_dim}")
-    print(f"  - Num Experts: {args.moe_num_experts}")
-    print(f"  - Top-K: {args.moe_top_k}")
-    print(f"  - MoE Loss Weight: {args.moe_loss_weight}")
     
     train_multi_dataset(args)
