@@ -89,28 +89,27 @@ def resolve_model_files(path_value, default_candidates=None):
 
 
 def replace_dit_model_in_manager():
-    """替换DiT模型类为MoE版本"""
-    from diffsynth.models.wan_video_dit_moe import WanModelMoe
+    """Replace DiT model class with camera version"""
+    from diffsynth.models.wan_video_dit_cam import WanModelCam
     from diffsynth.configs.model_config import model_loader_configs
-    
+
     for i, config in enumerate(model_loader_configs):
         keys_hash, keys_hash_with_shape, model_names, model_classes, model_resource = config
-        
+
         if 'wan_video_dit' in model_names:
             new_model_names = []
             new_model_classes = []
-            
+
             for name, cls in zip(model_names, model_classes):
                 if name == 'wan_video_dit':
                     new_model_names.append(name)
-                    new_model_classes.append(WanModelMoe)
-                    print(f"✅ 替换了模型类: {name} -> WanModelMoe")
+                    new_model_classes.append(WanModelCam)
                 else:
                     new_model_names.append(name)
                     new_model_classes.append(cls)
-            
+
             model_loader_configs[i] = (keys_hash, keys_hash_with_shape, new_model_names, new_model_classes, model_resource)
-            
+
 def add_framepack_components(dit_model):
     """添加FramePack相关组件"""
     if not hasattr(dit_model, 'clean_x_embedder'):
@@ -142,7 +141,7 @@ def add_framepack_components(dit_model):
         dit_model.clean_x_embedder = dit_model.clean_x_embedder.to(dtype=model_dtype)
         print("✅ 添加了FramePack的clean_x_embedder组件")
         
-def add_moe_components(dit_model, moe_config):
+def add_cpe_components(dit_model, moe_config):
     """🔧 添加MoE相关组件 - 修正版本"""
     if not hasattr(dit_model, 'moe_config'):
         dit_model.moe_config = moe_config
@@ -171,13 +170,12 @@ def add_moe_components(dit_model, moe_config):
 
         print(f"✅ Block {i} 添加了MoE组件 (unified_dim: {unified_dim}, experts: {moe_config.get('num_experts', 4)})")
 
-def call_wan_transformer(
+def call_wan_cpe_dit(
     transformer,
     latents,
     timesteps,
     context,
     cam_emb=None,
-    modality_inputs=None,
     model_kwargs=None,
 ):
     timestep_tensor = timesteps.to(latents.device, dtype=torch.float32)
@@ -189,8 +187,6 @@ def call_wan_transformer(
 
     if cam_emb is not None:
         forward_kwargs["cam_emb"] = cam_emb
-    if modality_inputs is not None:
-        forward_kwargs["modality_inputs"] = modality_inputs
 
     if model_kwargs:
         for key, value in model_kwargs.items():
@@ -250,7 +246,105 @@ def video_first_frame_to_pil(video_path):
 
     return pil_image
 
+def to_tensor(value, device, dtype=None, batch_dim=True):
+    """确保值为tensor并转移到指定设备"""
+    if value is None:
+        return None
+    tensor = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+    if tensor.numel() == 0:
+        return None
+    
+    if dtype is None and tensor.dtype.is_floating_point:
+        dtype = None  # 使用原dtype
+    
+    tensor = tensor.to(device=device, dtype=dtype)
+    if batch_dim and tensor.dim() == 4:
+        tensor = tensor.unsqueeze(0)
+    elif not batch_dim and tensor.dim() == 1:
+        tensor = tensor.unsqueeze(0)
+    elif not batch_dim and tensor.dim() == 0:
+        tensor = tensor.view(1, 1)
+    
+    return tensor
 
+
+def prepare_condition_for_sample(batch, sample_index, device, model_dtype):
+    """
+    为单个样本的采样准备条件
+    Args:
+        batch: 批次数据
+        sample_index: 样本索引
+        device: 设备
+        model_dtype: 模型数据类型
+    
+    Returns:
+        tuple: (conditioning, gt_extrinsics_tensor, prompt_text)
+    """
+    # 提取数据集信息
+    dataset_type = batch.get("dataset_type", ["sekai"])[0]
+    dataset_name = batch.get("dataset_name", ["unknown"])[0]
+    
+    # 准备相机嵌入
+    cam_emb = None
+    camera_batch = batch.get("camera")
+    if camera_batch is not None:
+        cam_value = camera_batch[sample_index]
+        cam_emb = to_tensor(cam_value, device, model_dtype, batch_dim=False)
+        if cam_emb.dim() == 2:
+            cam_emb = cam_emb.unsqueeze(0)
+    
+    # 准备模态输入
+    modality_inputs = {}
+    if cam_emb is not None:
+        modality_key = dataset_type if dataset_type in ("sekai", "nuscenes", "openx") else "sekai"
+        modality_inputs[modality_key] = cam_emb.clone()
+    modality_inputs = modality_inputs or None
+    
+    # 准备latents
+    latent_keys = [
+        ("latents", None), ("clean_latents", None),
+        ("clean_latents_2x", None), ("clean_latents_4x", None),
+        ("latent_indices", torch.long), ("clean_latent_indices", torch.long),
+        ("clean_latent_2x_indices", torch.long), ("clean_latent_4x_indices", torch.long)
+    ]
+    
+    framepack_pairs = {}
+    for key, dtype in latent_keys:
+        if key in batch:
+            value = batch[key][sample_index]
+            if "indices" in key:
+                framepack_pairs[key] = to_tensor(value, device, dtype, batch_dim=False)
+            else:
+                framepack_pairs[key] = to_tensor(value, device, model_dtype)
+    
+    # 准备文本和图像嵌入
+    prompt_text = batch["prompt_text"][sample_index]
+    context = batch["prompt_emb"]["context"][sample_index].to(device)
+    
+    image_emb = batch.get("image_emb", {})
+    image_tensor = None
+    if "clip_feature" in image_emb or "y" in image_emb:
+        image_tensor = image_emb.get("clip_feature", image_emb.get("y"))[sample_index].to(device)
+    
+    # 准备model_kwargs
+    model_kwargs = {k: v for k, v in framepack_pairs.items() if v is not None}
+    model_kwargs["context"] = context
+    if image_tensor is not None:
+        model_kwargs["image_emb"] = image_tensor
+    
+    # 准备ground truth extrinsics
+    gt_poses = batch.get("gt_absolute_poses", [None])[sample_index]
+    if gt_poses is None or not isinstance(gt_poses, list):
+        raise ValueError("Batch must contain 'gt_absolute_poses' as a list of tensors.")
+    gt_extrinsics_tensor = torch.stack(gt_poses, dim=0).to(device=device, dtype=torch.float32)
+    
+    conditioning = {
+        "cam_emb": cam_emb,
+        "modality_inputs": modality_inputs,
+        "model_kwargs": model_kwargs,
+    }
+    
+    return conditioning, gt_extrinsics_tensor, prompt_text
 
 def sd3_time_shift(shift, t):
     return (shift * t) / (1 + (shift - 1) * t)
@@ -302,42 +396,6 @@ def flux_step(
 def assert_eq(x, y, msg=None):
     assert x == y, f"{msg or 'Assertion failed'}: {x} != {y}"
 
-
-def prepare_latent_image_ids(batch_size, height, width, device, dtype):
-    latent_image_ids = torch.zeros(height, width, 3)
-    latent_image_ids[..., 1] = latent_image_ids[..., 1] + torch.arange(height)[:, None]
-    latent_image_ids[..., 2] = latent_image_ids[..., 2] + torch.arange(width)[None, :]
-
-    latent_image_id_height, latent_image_id_width, latent_image_id_channels = latent_image_ids.shape
-
-    latent_image_ids = latent_image_ids.reshape(
-        latent_image_id_height * latent_image_id_width, latent_image_id_channels
-    )
-
-    return latent_image_ids.to(device=device, dtype=dtype)
-
-def pack_latents(latents, batch_size, num_channels_latents, height, width):
-    latents = latents.view(batch_size, num_channels_latents, height // 2, 2, width // 2, 2)
-    latents = latents.permute(0, 2, 4, 1, 3, 5)
-    latents = latents.reshape(batch_size, (height // 2) * (width // 2), num_channels_latents * 4)
-
-    return latents
-
-def unpack_latents(latents, height, width, vae_scale_factor):
-    batch_size, num_patches, channels = latents.shape
-
-    # VAE applies 8x compression on images but we must also account for packing which requires
-    # latent height and width to be divisible by 2.
-    height = 2 * (int(height) // (vae_scale_factor * 2))
-    width = 2 * (int(width) // (vae_scale_factor * 2))
-
-    latents = latents.view(batch_size, height // 2, width // 2, channels // 4, 2, 2)
-    latents = latents.permute(0, 3, 1, 4, 2, 5)
-
-    latents = latents.reshape(batch_size, channels // (2 * 2), height, width)
-
-    return latents
-
 def run_sample_step(
         args,
         z,
@@ -361,16 +419,6 @@ def run_sample_step(
         cam_emb = conditioning.get("cam_emb")
         if isinstance(cam_emb, torch.Tensor):
             cam_emb = cam_emb.to(device=z.device, dtype=model_dtype)
-
-        modality_inputs = conditioning.get("modality_inputs")
-        prepared_modality_inputs = None
-        if modality_inputs is not None:
-            prepared_modality_inputs = {}
-            for key, value in modality_inputs.items():
-                if isinstance(value, torch.Tensor):
-                    prepared_modality_inputs[key] = value.to(device=z.device, dtype=model_dtype)
-                else:
-                    prepared_modality_inputs[key] = value
 
         prepared_model_kwargs = {}
         def _prepare_value(value):
@@ -416,13 +464,12 @@ def run_sample_step(
                 if z.device.type == "cuda"
                 else nullcontext()
             ):
-                pred = call_wan_transformer(
+                pred = call_wan_cpe_dit(
                     transformer,
                     z,
                     timesteps,
                     context,
                     cam_emb=cam_emb,
-                    modality_inputs=prepared_modality_inputs,
                     model_kwargs=forward_model_kwargs,
                 ).to(torch.float32)
 
@@ -468,16 +515,6 @@ def grpo_one_step(
     if isinstance(cam_emb, torch.Tensor):
         cam_emb = cam_emb.to(device=latents.device, dtype=model_dtype)
 
-    modality_inputs = conditioning.get("modality_inputs")
-    prepared_modality_inputs = None
-    if modality_inputs is not None:
-        prepared_modality_inputs = {}
-        for key, value in modality_inputs.items():
-            if isinstance(value, torch.Tensor):
-                prepared_modality_inputs[key] = value.to(device=latents.device, dtype=model_dtype)
-            else:
-                prepared_modality_inputs[key] = value
-
     prepared_model_kwargs = {}
     def _prepare_value(value):
         if value is None:
@@ -508,13 +545,12 @@ def grpo_one_step(
         if latents.device.type == "cuda"
         else nullcontext()
     ):
-        pred = call_wan_transformer(
+        pred = call_wan_cpe_dit(
             transformer,
             latents,
             timesteps.to(torch.float32),
             context,
             cam_emb=cam_emb,
-            modality_inputs=prepared_modality_inputs,
             model_kwargs=forward_model_kwargs,
         ).to(torch.float32)
 
@@ -543,180 +579,11 @@ def sample_reference_model(
     preprocess_val,
     train_step
 ):
-    # ------------------ 定义条件准备函数 --------------------
-    
-    def _ensure_batch_latents(value, target_dtype=None):
-        if value is None:
-            return None
-        tensor = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
-        if tensor.numel() == 0:
-            return None
-        tensor = tensor.to(device=device)
-        if target_dtype is not None:
-            tensor = tensor.to(dtype=target_dtype)
-        elif tensor.dtype.is_floating_point:
-            tensor = tensor.to(dtype=model_dtype)
-
-        if tensor is not None and len(tensor.shape) == 4: # [C, T, H, W]
-            tensor = tensor.unsqueeze(0) # -> [1, C, T, H, W]
-
-        return tensor
-    
-    def _ensure_batch_indices(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-            if tensor is None:
-                return None
-            if tensor.dim() == 0:
-                tensor = tensor.view(1, 1)
-            elif tensor.dim() == 1:
-                tensor = tensor.unsqueeze(0)
-            return tensor
-        
-    def prepare_latents(batch, key: str, sample_index: int):
-        latents_batch = batch.get(key)
-        if latents_batch is not None:
-            sample_latents = latents_batch[sample_index]
-        else:
-            raise ValueError(f"Batch does not contain key: {key}")
-        latents = _ensure_batch_latents(sample_latents)
-        return latents
-    
-    def prepare_latent_indices(batch, key: str, sample_index: int):
-        latent_idx_batch = batch.get(key)
-        if latent_idx_batch is not None:
-            sample_latent_idx = latent_idx_batch[sample_index]
-            latent_indices = torch.as_tensor(sample_latent_idx, device=device, dtype=torch.long)
-            latent_indices = _ensure_batch_indices(latent_indices)
-            return latent_indices
-        return None
-
-    def prepare_condition(sample_index: int):
-        # 确定数据集类型和名称
-        dataset_types = batch.get("dataset_type", ["sekai"])
-        if isinstance(dataset_types, list):
-            dataset_type = dataset_types[0]
-        elif isinstance(dataset_types, torch.Tensor):
-            dataset_type = dataset_types[0]
-        else:
-            dataset_type = dataset_types
-
-        dataset_names = batch.get("dataset_name", ["unknown"])
-        if isinstance(dataset_names, list):
-            dataset_name = dataset_names[0]
-        elif isinstance(dataset_types, torch.Tensor):
-            dataset_name = dataset_names[0]
-        else:
-            dataset_name = dataset_names
-        
-        # 准备相机嵌入
-        cam_emb = None
-        camera_batch = batch.get("camera")
-        if camera_batch is not None:
-            if isinstance(camera_batch, torch.Tensor):
-                cam_emb = camera_batch[sample_index].to(device=device, dtype=model_dtype)
-            else:
-                cam_value = camera_batch[sample_index]
-                cam_emb = torch.as_tensor(cam_value, device=device, dtype=model_dtype)
-            if cam_emb.dim() == 2:
-                cam_emb = cam_emb.unsqueeze(0)
-    
-
-        # 准备模态输入
-        modality_inputs = {}
-        if cam_emb is not None:
-            if dataset_type in ("sekai", "spatialvid"):
-                modality_inputs["sekai"] = cam_emb.clone()
-            elif dataset_type == "nuscenes":
-                modality_inputs["nuscenes"] = cam_emb.clone()
-            elif dataset_type == "openx":
-                modality_inputs["openx"] = cam_emb.clone()
-            else:
-                modality_inputs["sekai"] = cam_emb.clone()
-
-        # camera_dropout_prob = 0.05
-        # if random.random() < camera_dropout_prob:
-        #     cam_emb = torch.zeros_like(cam_emb)
-        #     # 同时清空modality_inputs
-        #     for key in modality_inputs:
-        #         modality_inputs[key] = torch.zeros_like(modality_inputs[key])
-        #     print(f"应用camera dropout for CFG training (dataset: {dataset_name}, type: {dataset_type})")
-
-        # 准备 latents 和索引
-        full_latents = prepare_latents(batch, "latents", sample_index)
-        clean_latents    = prepare_latents(batch, "clean_latents", sample_index)
-        clean_latents_2x = prepare_latents(batch, "clean_latents_2x", sample_index)
-        clean_latents_4x = prepare_latents(batch, "clean_latents_4x", sample_index)
-
-        latent_indices          = prepare_latent_indices(batch, "latent_indices", sample_index)
-        clean_latent_indices    = prepare_latent_indices(batch, "clean_latent_indices", sample_index)
-        clean_latent_2x_indices = prepare_latent_indices(batch, "clean_latent_2x_indices", sample_index)
-        clean_latent_4x_indices = prepare_latent_indices(batch, "clean_latent_4x_indices", sample_index)
-
-        framepack_pairs = {
-            "latent_indices": latent_indices,
-            "clean_latents": clean_latents,
-            "clean_latent_indices": clean_latent_indices,
-            "clean_latents_2x": clean_latents_2x,
-            "clean_latent_2x_indices": clean_latent_2x_indices,
-            "clean_latents_4x": clean_latents_4x,
-            "clean_latent_4x_indices": clean_latent_4x_indices,
-            }
-
-        # 准备文本嵌入
-        #prompt_emb = batch.get("prompt_emb")[sample_index]
-        prompt_emb = batch.get("prompt_emb")["context"]
-        contex_tensor = prompt_emb[sample_index].to(device)
-        batch_prompt_text = batch.get("prompt_text")    
-        prompt_text = batch_prompt_text[sample_index]
-
-        # 准备其他嵌入
-        #image_emb = batch.get("image_emb")[sample_index]
-        image_emb = batch.get("image_emb")
-        image_tensor = None
-        if "clip_feature" in image_emb:
-            image_tensor = image_emb["clip_feature"][sample_index].to(device)
-        if "y" in image_emb:
-            image_tensor = image_emb["clip_feature"][sample_index].to(device)
-        
-        model_kwargs = {}
-        for key, value in framepack_pairs.items():
-            if value is not None:
-                model_kwargs[key] = value
-        if contex_tensor is not None:
-            model_kwargs["context"] = contex_tensor
-        if image_tensor is not None:
-            model_kwargs["image_emb"] = image_tensor
-
-        # 准备数据集中的真实相机位姿数据，用于计算奖励
-        gt_extrinsics_tensor = None
-        gt_absolute_poses = batch.get("gt_absolute_poses")[sample_index]
-        if gt_absolute_poses is not None and isinstance(gt_absolute_poses, list):
-            gt_extrinsics_tensor = torch.stack(gt_absolute_poses, dim=0).to(device=device, dtype=torch.float32)
-        else:
-            raise ValueError("Batch must contain 'gt_absolute_poses' as a list of tensors.")
-                
-
-        if modality_inputs == {}:
-            modality_inputs = None
-        # print([[k, v.shape] if "indices" not in k else [k, v] for k, v in framepack_pairs.items()], gt_extrinsics_tensor.shape)
-        conditioning = {
-            "cam_emb": cam_emb,
-            "modality_inputs": modality_inputs,
-            "model_kwargs": model_kwargs,
-        }
-
-        return conditioning, gt_extrinsics_tensor, prompt_text
-
-
-    # ------------------- 条件准备函数结束 -----------------------
-
-    
     w, h, t = args.w, args.h, args.t
     sample_steps = args.sampling_steps
     sigma_schedule = torch.linspace(1, 0, args.sampling_steps + 1)
 
     sigma_schedule = sd3_time_shift(args.shift, sigma_schedule)
-
-    transformer = pipe.dit
 
     _ = (tokenizer, preprocess_val)
 
@@ -744,7 +611,7 @@ def sample_reference_model(
     all_latents = []
     all_log_probs = []
     all_rewards = []  
-    model_dtype = next(transformer.parameters()).dtype
+    model_dtype = next(pipe.dit.parameters()).dtype
     conditioning_records = []
 
     # 为每个样本初始化相同噪声
@@ -757,8 +624,9 @@ def sample_reference_model(
 
     for index, batch_idx in enumerate(batch_indices):
         sample_index = batch_idx[0].item()
-        conditioning, gt_extrinsics, prompt_text = prepare_condition(sample_index)
-        # print(f"input latents shape: {input_latents.shape}, gt_extrinsics shape: {gt_extrinsics.shape}")
+        conditioning, gt_extrinsics, prompt_text = prepare_condition_for_sample(
+            batch, sample_index, device, model_dtype
+        )
         conditioning_records.append({
             "conditioning": conditioning,
             "gt_extrinsics": gt_extrinsics,
@@ -768,13 +636,14 @@ def sample_reference_model(
         if args.init_same_noise:
             input_latents = input_latents + torch.randn_like(input_latents) * 0.02
         
-        # # 为每个样本初始化不同噪声
-        # if not args.init_same_noise:
-        #     input_latents = torch.randn(
-        #             (1, IN_CHANNELS, latent_t, latent_h, latent_w),  # (c,t,h,w)
-        #             device=device,
-        #             dtype=model_dtype,
-        #         )
+        # 为每个样本初始化不同噪声
+        if not args.init_same_noise:
+            input_latents = torch.randn(
+                    (1, IN_CHANNELS, latent_t, latent_h, latent_w),  # (c,t,h,w)
+                    device=device,
+                    dtype=model_dtype,
+                )
+        
         grpo_sample=True
         progress_bar = tqdm(range(0, sample_steps), desc="Sampling Progress")
         with torch.no_grad():
@@ -783,7 +652,7 @@ def sample_reference_model(
                 input_latents.clone(),
                 progress_bar,
                 sigma_schedule,
-                transformer,
+                pipe.dit,
                 conditioning_records[-1]["conditioning"],
                 grpo_sample,
             )
@@ -817,63 +686,45 @@ def sample_reference_model(
         prompt_output_path = f"{args.experiment_dir}/prompts/wan_2_1_step_{train_step+1}_rank_{rank}_{index}.txt"
         with open(prompt_output_path, "w", encoding="utf-8") as f:
             f.write(prompt_text)
-        
-        if args.use_hpsv2:
-            with torch.no_grad():
-                image_path = video_first_frame_to_pil(f"{args.experiment_dir}/wan_2_1_step_{train_step}_rank_{rank}_{index}.mp4")
-                image = preprocess_val(image_path).unsqueeze(0).to(device=device, non_blocking=True)
-                # Process the prompt
-                text = conditioning_records[-1]["conditioning"]["model_kwargs"]["context"].to(device=device, non_blocking=True)
-                print(f"text shape: {text.shape}")
-                # Calculate the HPS
-                with torch.amp.autocast('cuda'):
-                    text = text.long()
-                    text = text.squeeze(0)
-                    outputs = reward_model(image, text)
-                    image_features, text_features = outputs["image_features"], outputs["text_features"]
-                    logits_per_image = image_features @ text_features.T
-                    hps_score = torch.diagonal(logits_per_image)
-                all_rewards.append(hps_score)
-        
-        else:
-            gt_extrinsics_tensor = conditioning_records[-1].get("gt_extrinsics")
-            if gt_extrinsics_tensor is None:
-                raise RuntimeError("Ground-truth extrinsics are required to compute the reward.")
 
-            gt_extrinsics_np = gt_extrinsics_tensor.detach().cpu().numpy()
-            reward_info = {}
-            try:
-                decoded_video = decoded_video.transpose(1, 2)
-                video_min = decoded_video.min()
-                video_max = decoded_video.max()
-                normalized_video = 2 * (decoded_video - video_min) / (video_max - video_min + 1e-8) - 1
-                reward_info = reward_model.calculate_reward(normalized_video, gt_extrinsics_np)
-                
-                # print("\n--- 对齐奖励结果 ---")
-                # print(f"平均旋转误差: {reward_info['mean_rotation_error_degrees']:.2f} 度")
-                # print(f"平均平移误差 (尺度对齐后): {reward_info['mean_translation_error']:.4f}")
-                # print(f"计算出的轨迹尺度因子: {reward_info['translation_scale_factor']:.4f}")
-                # print("-" * 20)
-                # print(f"旋转奖励: {reward_info['rotation_reward']:.4f}")
-                # print(f"平移奖励: {reward_info['translation_reward']:.4f}")
-                # print(f"最终加权总奖励: {reward_info['total_reward']:.4f}")
-                # print("----------------------\n")
-                
-                with open(target_pose_output_path, "a", encoding="utf-8") as f:
-                    f.write(f"\n--- 对齐奖励结果 ---\n")
-                    f.write(f"平均旋转误差: {reward_info['mean_rotation_error_degrees']:.2f} 度\n")
-                    f.write(f"平均平移误差 (尺度对齐后): {reward_info['mean_translation_error']:.4f}\n")
-                    f.write(f"计算出的轨迹尺度因子: {reward_info['translation_scale_factor']:.4f}\n")
-                    f.write("-" * 20 + "\n")
-                    f.write(f"旋转奖励: {reward_info['rotation_reward']:.4f}\n")
-                    f.write(f"平移奖励: {reward_info['translation_reward']:.4f}\n")
-                    f.write(f"最终加权总奖励: {reward_info['total_reward']:.4f}\n")
-                    f.write("----------------------\n")
-                
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                print(f"在计算奖励时发生错误: {e}")
+        # Calculate 3D-Aware Reward
+        gt_extrinsics_tensor = conditioning_records[-1].get("gt_extrinsics")
+        if gt_extrinsics_tensor is None:
+            raise RuntimeError("Ground-truth extrinsics are required to compute the reward.")
+        gt_extrinsics_np = gt_extrinsics_tensor.detach().cpu().numpy()
+        reward_info = {}
+        try:
+            decoded_video = decoded_video.transpose(1, 2)
+            video_min = decoded_video.min()
+            video_max = decoded_video.max()
+            normalized_video = 2 * (decoded_video - video_min) / (video_max - video_min + 1e-8) - 1
+            reward_info = reward_model.calculate_reward(normalized_video, gt_extrinsics_np)
+            
+            # print("\n--- 对齐奖励结果 ---")
+            # print(f"平均旋转误差: {reward_info['mean_rotation_error_degrees']:.2f} 度")
+            # print(f"平均平移误差 (尺度对齐后): {reward_info['mean_translation_error']:.4f}")
+            # print(f"计算出的轨迹尺度因子: {reward_info['translation_scale_factor']:.4f}")
+            # print("-" * 20)
+            # print(f"旋转奖励: {reward_info['rotation_reward']:.4f}")
+            # print(f"平移奖励: {reward_info['translation_reward']:.4f}")
+            # print(f"最终加权总奖励: {reward_info['total_reward']:.4f}")
+            # print("----------------------\n")
+            
+            with open(target_pose_output_path, "a", encoding="utf-8") as f:
+                f.write(f"\n--- 对齐奖励结果 ---\n")
+                f.write(f"平均旋转误差: {reward_info['mean_rotation_error_degrees']:.2f} 度\n")
+                f.write(f"平均平移误差 (尺度对齐后): {reward_info['mean_translation_error']:.4f}\n")
+                f.write(f"计算出的轨迹尺度因子: {reward_info['translation_scale_factor']:.4f}\n")
+                f.write("-" * 20 + "\n")
+                f.write(f"旋转奖励: {reward_info['rotation_reward']:.4f}\n")
+                f.write(f"平移奖励: {reward_info['translation_reward']:.4f}\n")
+                f.write(f"最终加权总奖励: {reward_info['total_reward']:.4f}\n")
+                f.write("----------------------\n")
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"在计算奖励时发生错误: {e}")
 
         if not reward_info:
             raise ValueError("reward_info calculation fault")
@@ -921,11 +772,10 @@ def train_one_step(
     preprocess_val,
     train_step,
 ):
-    transformer = pipe.dit
 
     total_loss = 0.0
     optimizer.zero_grad()
-    model_dtype = next(transformer.parameters()).dtype
+    model_dtype = next(pipe.dit.parameters()).dtype
     batch = to_device(batch, device, model_dtype)
 
     if args.use_group:
@@ -1013,7 +863,7 @@ def train_one_step(
                 args,
                 sample["latents"][:, step_idx],
                 sample["next_latents"][:, step_idx],
-                transformer,
+                pipe.dit,
                 sample["timesteps"][:, step_idx],
                 perms[i][step_idx],
                 sigma_schedule,
@@ -1042,7 +892,7 @@ def train_one_step(
             total_loss += avg_loss.item()
         
         if (i+1)%args.gradient_accumulation_steps==0:
-            grad_norm = torch.nn.utils.clip_grad_norm_(transformer.parameters(), max_norm=max_grad_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(pipe.dit.parameters(), max_norm=max_grad_norm)
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
@@ -1101,7 +951,6 @@ def main(args):
     main_print("--> Loading CameraAlignmentReward Model")
     reward_model = CameraAlignmentReward(rank=rank, device=device)
 
-    # 1. 模型初始化
     replace_dit_model_in_manager()
     
     model_manager = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
@@ -1112,50 +961,54 @@ def main(args):
     ])
     pipe = WanVideoAstraPipeline.from_model_manager(model_manager, device="cuda")
 
-    # 2. 添加传统camera编码器（兼容性）
-    dim = pipe.dit.blocks[0].self_attn.q.weight.shape[0]
-    for block in pipe.dit.blocks:
-        block.cam_encoder = nn.Linear(13, dim)
-        block.projector = nn.Linear(dim, dim)
-        block.cam_encoder.weight.data.zero_()
-        block.cam_encoder.bias.data.zero_()
-        block.projector.weight = nn.Parameter(torch.eye(dim))
-        block.projector.bias = nn.Parameter(torch.zeros(dim))
-    
-    # 3. 添加FramePack组件
     add_framepack_components(pipe.dit)
     
-    # 4. 添加MoE组件
-    moe_config = {
-        "num_experts": args.moe_num_experts,
-        "top_k": args.moe_top_k,
-        "hidden_dim": args.moe_hidden_dim or dim * 2,
-        "sekai_input_dim": 13,    # Sekai: 12维pose + 1维mask
-        "nuscenes_input_dim": 8,   # NuScenes: 7维pose + 1维mask
-        "openx_input_dim": 13       # OpenX: 12维pose + 1维mask (类似sekai)
-    }
-    add_moe_components(pipe.dit, moe_config)
+    from diffsynth.models.wan_video_dit_cam import Cam_Encoder, Cam_Processor
+    pipe.dit.cam_processor = Cam_Processor(13, 25) # project the input dim to unified dim
     
-    # 5. 加载训练好的权重
+    dim = pipe.dit.blocks[0].self_attn.q.weight.shape[0]
+    for i, block in enumerate(pipe.dit.blocks):
+        # Add Camera Pose Encoder
+        block.cpe = Cam_Encoder(
+            unified_dim=25,
+            output_dim=dim
+        )
+        block.projector = nn.Linear(dim, dim)
+        block.projector.weight = nn.Parameter(torch.eye(dim))
+        block.projector.bias = nn.Parameter(torch.zeros(dim))
+
+    key_parts_map = {
+        'sekai_processor': 'cam_processor',
+        'moe.experts.0': 'cpe.encoder'
+    }
     dit_state_dict = torch.load(args.our_checkpoint_path, map_location="cpu")
+    
+    # modify parameters name
+    keys_to_replace = []
+    for old_key in dit_state_dict.keys():
+        for old_key_parts in key_parts_map.keys():
+            if isinstance(old_key, str) and old_key_parts in old_key:
+                keys_to_replace.append(old_key)
+                
+    for old_key in keys_to_replace:
+        value = dit_state_dict[old_key]
+        for old_key_parts, new_key_parts in key_parts_map.items():
+            if old_key_parts in old_key:
+                new_key = old_key.replace(old_key_parts, new_key_parts)
+                del dit_state_dict[old_key]
+                dit_state_dict[new_key] = value
+    
     pipe.dit.load_state_dict(dit_state_dict, strict=False)  # 使用strict=False以兼容新增的MoE组件
     
     pipe.dit.requires_grad_(False)
     for name, module in pipe.dit.named_modules():
-        if any(keyword in name for keyword in ["cam_encoder", "projector", "clean_x_embedder", 
-                                            "moe", "sekai_processor", "nuscenes_processor","openx_processor"]):
+        if any(keyword in name for keyword in ["cam_encoder", "projector", "clean_x_embedder", "cpe", "cam_processor"]):
             for param in module.parameters():
                 param.requires_grad = True
-                
-    # dit_state_dict = torch.load(args.our_checkpoint_path, map_location="cpu")
-    # pipe.dit.load_state_dict(dit_state_dict, strict=False)  # 使用strict=False以兼容新增的MoE组件
     
     pipe = pipe.to(device)
     model_dtype = next(pipe.dit.parameters()).dtype
     
-    if hasattr(pipe.dit, 'clean_x_embedder'):
-        pipe.dit.clean_x_embedder = pipe.dit.clean_x_embedder.to(dtype=model_dtype)
-
     transformer = pipe.dit
 
     if args.gradient_checkpointing:
@@ -1226,7 +1079,7 @@ def main(args):
     )
     sampler = DistributedSampler(
             train_dataset, rank=rank, num_replicas=world_size, shuffle=True, seed=args.sampler_seed
-        )
+    )
 
 
     train_dataloader = DataLoader(
@@ -1580,12 +1433,6 @@ if __name__ == "__main__":
         help="num_generations per prompt",
     )
     parser.add_argument(
-        "--use_hpsv2",
-        action="store_true",
-        default=False,
-        help="whether use hpsv2 as reward model",
-    )
-    parser.add_argument(
         "--ignore_last",
         action="store_true",
         default=False,
@@ -1634,18 +1481,6 @@ if __name__ == "__main__":
         type=str,
         default="checkpoints/our_model.ckpt",
         help="Path to save our model checkpoints.",
-    )
-    parser.add_argument(
-        "--moe_num_experts",
-        type=int,
-        default=4,
-        help="Number of experts in MoE.",
-    )
-    parser.add_argument(
-        "--moe_top_k",
-        type=int,
-        default=1,
-        help="Top-k experts to use in MoE.",
     )
     parser.add_argument(
         "--moe_hidden_dim",
@@ -1699,13 +1534,6 @@ if __name__ == "__main__":
         default=16,
         help="Alpha for LoRA adapters.",
     )
-    parser.add_argument(
-        "--resume_from_lora_checkpoint",
-        type=str,
-        default=None,
-        help="Path to resume LoRA checkpoint.",
-    )
-
 
     args = parser.parse_args()
     main(args)

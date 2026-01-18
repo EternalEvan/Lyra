@@ -490,7 +490,7 @@ def inference_framepack_sliding_window(
         block.projector.weight = nn.Parameter(torch.eye(dim))
         block.projector.bias = nn.Parameter(torch.zeros(dim))
         
-    # 4. Load trained weights
+    # 4. Load trained weights (Adaptation for weight loading of Astra)
     key_parts_map = {
         'sekai_processor': 'cam_processor',
         'moe.experts.0': 'cpe.encoder'
