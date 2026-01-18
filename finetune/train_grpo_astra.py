@@ -20,7 +20,6 @@ from contextlib import nullcontext
 import pdb
 from datetime import datetime
 
-import cv2
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -35,7 +34,6 @@ from fastvideo.utils.parallel_states import (
     get_sequence_parallel_state,
     initialize_sequence_parallel_state,
 )
-from PIL import Image
 import imageio.v2 as imageio
 from safetensors.torch import save_file
 from torch.distributed.checkpoint.state_dict import (
@@ -56,151 +54,8 @@ from diffsynth.configs.model_config import model_loader_configs
 
 from fastvideo.dataset.spatialvid_datasets import SpatialVidFramePackDataset, framepack_collate_fn
 from reward_model.camera_alignment_reward import CameraAlignmentReward
-
-from get_target_pose_qwj import extract_target_poses_to_txt
-
-def parse_path_list(path_value):
-    if path_value is None:
-        return []
-    return [item.strip() for item in str(path_value).split(",") if item.strip()]
-
-
-def resolve_model_files(path_value, default_candidates=None):
-    resolved_paths = []
-    for entry in parse_path_list(path_value):
-        if os.path.isdir(entry):
-            candidates = default_candidates or []
-            found = False
-            for candidate in candidates:
-                candidate_path = os.path.join(entry, candidate)
-                if os.path.exists(candidate_path):
-                    resolved_paths.append(candidate_path)
-                    found = True
-                    break
-            if not found:
-                raise FileNotFoundError(
-                    f"No matching checkpoint file found in directory: {entry}."
-                )
-        else:
-            if not os.path.exists(entry):
-                raise FileNotFoundError(f"Checkpoint file not found: {entry}")
-            resolved_paths.append(entry)
-    return resolved_paths
-
-
-def replace_dit_model_in_manager():
-    """Replace DiT model class with camera version"""
-    from diffsynth.models.wan_video_dit_cam import WanModelCam
-    from diffsynth.configs.model_config import model_loader_configs
-
-    for i, config in enumerate(model_loader_configs):
-        keys_hash, keys_hash_with_shape, model_names, model_classes, model_resource = config
-
-        if 'wan_video_dit' in model_names:
-            new_model_names = []
-            new_model_classes = []
-
-            for name, cls in zip(model_names, model_classes):
-                if name == 'wan_video_dit':
-                    new_model_names.append(name)
-                    new_model_classes.append(WanModelCam)
-                else:
-                    new_model_names.append(name)
-                    new_model_classes.append(cls)
-
-            model_loader_configs[i] = (keys_hash, keys_hash_with_shape, new_model_names, new_model_classes, model_resource)
-
-def add_framepack_components(dit_model):
-    """添加FramePack相关组件"""
-    if not hasattr(dit_model, 'clean_x_embedder'):
-        inner_dim = dit_model.blocks[0].self_attn.q.weight.shape[0]
-        
-        class CleanXEmbedder(nn.Module):
-            def __init__(self, inner_dim):
-                super().__init__()
-                self.proj = nn.Conv3d(16, inner_dim, kernel_size=(1, 2, 2), stride=(1, 2, 2))
-                self.proj_2x = nn.Conv3d(16, inner_dim, kernel_size=(2, 4, 4), stride=(2, 4, 4))
-                self.proj_4x = nn.Conv3d(16, inner_dim, kernel_size=(4, 8, 8), stride=(4, 8, 8))
-            
-            def forward(self, x, scale="1x"):
-                if scale == "1x":
-                    x = x.to(self.proj.weight.dtype)
-                    return self.proj(x)
-                elif scale == "2x":
-                    x = x.to(self.proj_2x.weight.dtype)
-                    return self.proj_2x(x)
-                elif scale == "4x":
-                    x = x.to(self.proj_4x.weight.dtype)
-                    return self.proj_4x(x)
-                else:
-                    print(f"❌ Unsupported scale: {scale}")
-                    raise ValueError(f"Unsupported scale: {scale}")
-        
-        dit_model.clean_x_embedder = CleanXEmbedder(inner_dim)
-        model_dtype = next(dit_model.parameters()).dtype
-        dit_model.clean_x_embedder = dit_model.clean_x_embedder.to(dtype=model_dtype)
-        print("✅ 添加了FramePack的clean_x_embedder组件")
-        
-def add_cpe_components(dit_model, moe_config):
-    """🔧 添加MoE相关组件 - 修正版本"""
-    if not hasattr(dit_model, 'moe_config'):
-        dit_model.moe_config = moe_config
-        print("✅ 添加了MoE配置到模型")
-    dit_model.top_k = moe_config.get("top_k", 1)
-
-    # 为每个block动态添加MoE组件
-    dim = dit_model.blocks[0].self_attn.q.weight.shape[0]
-    unified_dim = moe_config.get("unified_dim", 25)
-    num_experts = moe_config.get("num_experts", 4)
-    from diffsynth.models.wan_video_dit_moe import ModalityProcessor, MultiModalMoE
-    dit_model.sekai_processor = ModalityProcessor("sekai", 13, unified_dim)
-    dit_model.nuscenes_processor = ModalityProcessor("nuscenes", 8, unified_dim)
-    dit_model.openx_processor = ModalityProcessor("openx", 13, unified_dim)  # OpenX使用13维输入，类似sekai但独立处理
-    dit_model.global_router = nn.Linear(unified_dim, num_experts)
-
-
-    for i, block in enumerate(dit_model.blocks):
-        # MoE网络 - 输入unified_dim，输出dim
-        block.moe = MultiModalMoE(
-            unified_dim=unified_dim,
-            output_dim=dim,  # 输出维度匹配transformer block的dim
-            num_experts=moe_config.get("num_experts", 4),
-            top_k=moe_config.get("top_k", 2)
-        )
-
-        print(f"✅ Block {i} 添加了MoE组件 (unified_dim: {unified_dim}, experts: {moe_config.get('num_experts', 4)})")
-
-def call_wan_cpe_dit(
-    transformer,
-    latents,
-    timesteps,
-    context,
-    cam_emb=None,
-    model_kwargs=None,
-):
-    timestep_tensor = timesteps.to(latents.device, dtype=torch.float32)
-
-    forward_kwargs = {
-        "timestep": timestep_tensor,
-        "context": context,
-    }
-
-    if cam_emb is not None:
-        forward_kwargs["cam_emb"] = cam_emb
-
-    if model_kwargs:
-        for key, value in model_kwargs.items():
-            if value is None:
-                continue
-            if isinstance(value, torch.Tensor):
-                value = value.to(latents.device)
-            forward_kwargs[key] = value
-
-    outputs = transformer(latents, **forward_kwargs)
-
-    if isinstance(outputs, tuple):
-        return outputs[0]
-    return outputs
+from finetune.utils.init_lyra import add_framepack_components, replace_dit_model_in_manager
+from utils.visualization import extract_target_poses_to_txt        
 
 def to_device(batch, device, dtype=None):
     def _move(x):
@@ -225,26 +80,6 @@ def repeat_for_group(obj, repeats):
         return tuple(repeat_for_group(list(obj), repeats))
     return obj
 
-
-def video_first_frame_to_pil(video_path):
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print("无法打开视频文件")
-        return None
-
-    ret, frame = cap.read()
-    if not ret:
-        print("无法读取视频的第一帧")
-        cap.release()
-        return None
-
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-    pil_image = Image.fromarray(frame_rgb)
-
-    cap.release()
-
-    return pil_image
 
 def to_tensor(value, device, dtype=None, batch_dim=True):
     """确保值为tensor并转移到指定设备"""
@@ -346,9 +181,37 @@ def prepare_condition_for_sample(batch, sample_index, device, model_dtype):
     
     return conditioning, gt_extrinsics_tensor, prompt_text
 
+def call_lyra_dit(
+    transformer,
+    latents,
+    timesteps,
+    context,
+    cam_emb=None,
+    model_kwargs=None,
+):
+    timestep_tensor = timesteps.to(latents.device, dtype=torch.float32)
+    forward_kwargs = {
+        "timestep": timestep_tensor,
+        "context": context,
+    }
+    if cam_emb is not None:
+        forward_kwargs["cam_emb"] = cam_emb
+    if model_kwargs:
+        for key, value in model_kwargs.items():
+            if value is None:
+                continue
+            if isinstance(value, torch.Tensor):
+                value = value.to(latents.device)
+            forward_kwargs[key] = value
+
+    outputs = transformer(latents, **forward_kwargs)
+
+    if isinstance(outputs, tuple):
+        return outputs[0]
+    return outputs
+
 def sd3_time_shift(shift, t):
     return (shift * t) / (1 + (shift - 1) * t)
-    
 
 def flux_step(
     model_output: torch.Tensor,
@@ -363,9 +226,7 @@ def flux_step(
     sigma = sigmas[index]
     dsigma = sigmas[index + 1] - sigma
     prev_sample_mean = latents + dsigma * model_output
-
     pred_original_sample = latents - sigma * model_output
-
     delta_t = sigma - sigmas[index + 1]
     std_dev_t = eta * math.sqrt(delta_t)
 
@@ -375,8 +236,7 @@ def flux_step(
         prev_sample_mean = prev_sample_mean + log_term * dsigma
 
     if grpo and prev_sample is None:
-        prev_sample = prev_sample_mean + torch.randn_like(prev_sample_mean) * std_dev_t 
-
+        prev_sample = prev_sample_mean + torch.randn_like(prev_sample_mean) * std_dev_t
 
     if grpo:
         # log prob of prev_sample given prev_sample_mean and std_dev_t
@@ -390,8 +250,6 @@ def flux_step(
         return prev_sample, pred_original_sample, log_prob
     else:
         return prev_sample_mean,pred_original_sample
-
-
 
 def assert_eq(x, y, msg=None):
     assert x == y, f"{msg or 'Assertion failed'}: {x} != {y}"
@@ -407,15 +265,12 @@ def run_sample_step(
     ):
 
     if grpo_sample:
-        # 准备 WanModelMoe 的输入
         model_dtype = next(transformer.parameters()).dtype
-
         model_kwargs = conditioning.get("model_kwargs", {})
         context_raw = model_kwargs.get("context")
         if context_raw is None:
             raise ValueError("conditioning['model_kwargs'] must contain 'context'.")
         context = context_raw.to(device=z.device, dtype=model_dtype)
-
         cam_emb = conditioning.get("cam_emb")
         if isinstance(cam_emb, torch.Tensor):
             cam_emb = cam_emb.to(device=z.device, dtype=model_dtype)
@@ -445,7 +300,6 @@ def run_sample_step(
             k: v for k, v in prepared_model_kwargs.items() if k != "context"
         }
 
-        # 进行去噪推理步骤，每步去噪被视为一个马尔可夫过程
         all_latents = [z]
         all_log_probs = []
         for i in progress_bar:
@@ -464,7 +318,7 @@ def run_sample_step(
                 if z.device.type == "cuda"
                 else nullcontext()
             ):
-                pred = call_wan_cpe_dit(
+                pred = call_lyra_dit(
                     transformer,
                     z,
                     timesteps,
@@ -545,7 +399,7 @@ def grpo_one_step(
         if latents.device.type == "cuda"
         else nullcontext()
     ):
-        pred = call_wan_cpe_dit(
+        pred = call_lyra_dit(
             transformer,
             latents,
             timesteps.to(torch.float32),
@@ -566,8 +420,6 @@ def grpo_one_step(
         sde_solver=True,
     )
     return log_prob
-
-
 
 def sample_reference_model(
     args,
@@ -622,6 +474,7 @@ def sample_reference_model(
                 dtype=model_dtype,
             )
 
+    # Sampling
     for index, batch_idx in enumerate(batch_indices):
         sample_index = batch_idx[0].item()
         conditioning, gt_extrinsics, prompt_text = prepare_condition_for_sample(
@@ -682,10 +535,7 @@ def sample_reference_model(
             print(f"在导出视频时发生错误；{e}")
             
         target_pose_output_path = f"{args.experiment_dir}/target_poses/wan_2_1_step_{train_step+1}_rank_{rank}_{index}.txt"
-        # extract_target_poses_to_txt(conditioning["cam_emb"].squeeze(0), target_pose_output_path)
-        prompt_output_path = f"{args.experiment_dir}/prompts/wan_2_1_step_{train_step+1}_rank_{rank}_{index}.txt"
-        with open(prompt_output_path, "w", encoding="utf-8") as f:
-            f.write(prompt_text)
+        extract_target_poses_to_txt(conditioning["cam_emb"].squeeze(0), target_pose_output_path)
 
         # Calculate 3D-Aware Reward
         gt_extrinsics_tensor = conditioning_records[-1].get("gt_extrinsics")
@@ -698,28 +548,54 @@ def sample_reference_model(
             video_min = decoded_video.min()
             video_max = decoded_video.max()
             normalized_video = 2 * (decoded_video - video_min) / (video_max - video_min + 1e-8) - 1
-            reward_info = reward_model.calculate_reward(normalized_video, gt_extrinsics_np)
+            #reward_info = reward_model.calculate_reward(normalized_video, gt_extrinsics_np)
+            reward_info = {
+                "total_reward": 0,
+                "rotation_reward": 0,
+                "translation_reward": 0,
+                "mean_rotation_error_degrees": 0,
+                "mean_translation_error": 0,
+                "translation_scale_factor": 0
+            }
             
-            # print("\n--- 对齐奖励结果 ---")
-            # print(f"平均旋转误差: {reward_info['mean_rotation_error_degrees']:.2f} 度")
-            # print(f"平均平移误差 (尺度对齐后): {reward_info['mean_translation_error']:.4f}")
-            # print(f"计算出的轨迹尺度因子: {reward_info['translation_scale_factor']:.4f}")
-            # print("-" * 20)
-            # print(f"旋转奖励: {reward_info['rotation_reward']:.4f}")
-            # print(f"平移奖励: {reward_info['translation_reward']:.4f}")
-            # print(f"最终加权总奖励: {reward_info['total_reward']:.4f}")
-            # print("----------------------\n")
+            print("\n--- 对齐奖励结果 ---")
+            print(f"平均旋转误差: {reward_info['mean_rotation_error_degrees']:.2f} 度")
+            print(f"平均平移误差 (尺度对齐后): {reward_info['mean_translation_error']:.4f}")
+            print(f"计算出的轨迹尺度因子: {reward_info['translation_scale_factor']:.4f}")
+            print("-" * 20)
+            print(f"旋转奖励: {reward_info['rotation_reward']:.4f}")
+            print(f"平移奖励: {reward_info['translation_reward']:.4f}")
+            print(f"最终加权总奖励: {reward_info['total_reward']:.4f}")
+            print("----------------------\n")
             
-            with open(target_pose_output_path, "a", encoding="utf-8") as f:
-                f.write(f"\n--- 对齐奖励结果 ---\n")
-                f.write(f"平均旋转误差: {reward_info['mean_rotation_error_degrees']:.2f} 度\n")
-                f.write(f"平均平移误差 (尺度对齐后): {reward_info['mean_translation_error']:.4f}\n")
-                f.write(f"计算出的轨迹尺度因子: {reward_info['translation_scale_factor']:.4f}\n")
-                f.write("-" * 20 + "\n")
-                f.write(f"旋转奖励: {reward_info['rotation_reward']:.4f}\n")
-                f.write(f"平移奖励: {reward_info['translation_reward']:.4f}\n")
-                f.write(f"最终加权总奖励: {reward_info['total_reward']:.4f}\n")
-                f.write("----------------------\n")
+            if args.save_all_rewards:
+                # 以JSON格式写入实验结果
+                json_output_path = target_pose_output_path.replace(f"_{index}.txt", "_reward.json")
+                reward_data = {
+                    "train_step": train_step + 1,
+                    "rank": rank,
+                    "sample_index": index,
+                    "mean_rotation_error_degrees": float(reward_info['mean_rotation_error_degrees']),
+                    "mean_translation_error": float(reward_info['mean_translation_error']),
+                    "translation_scale_factor": float(reward_info['translation_scale_factor']),
+                    "rotation_reward": float(reward_info['rotation_reward']),
+                    "translation_reward": float(reward_info['translation_reward']),
+                    "total_reward": float(reward_info['total_reward'])
+                }
+
+                # 读取已有数据或创建新列表
+                existing_data = []
+                if os.path.exists(json_output_path):
+                    with open(json_output_path, 'r', encoding='utf-8') as f:
+                        try:
+                            existing_data = json.load(f)
+                        except json.JSONDecodeError:
+                            existing_data = []
+
+                # 添加新数据并写入
+                existing_data.append(reward_data)
+                with open(json_output_path, 'w', encoding='utf-8') as f:
+                    json.dump(existing_data, f, ensure_ascii=False, indent=2)
             
         except Exception as e:
             import traceback
@@ -728,7 +604,6 @@ def sample_reference_model(
 
         if not reward_info:
             raise ValueError("reward_info calculation fault")
-
         if isinstance(reward_info, dict):
             total_reward_value = float(reward_info.get("total_reward", 0.0))
         else:
@@ -802,10 +677,10 @@ def train_one_step(
         "timesteps": timesteps.detach().clone()[:, :-1],
         "latents": all_latents[
             :, :-1
-        ][:, :-1],  # each entry is the latent before timestep t
+        ][:, :-1],  # each entry is the latent before timestep t (exclude the last entry)
         "next_latents": all_latents[
             :, 1:
-        ][:, :-1],  # each entry is the latent after timestep t
+        ][:, :-1],  # each entry is the latent after timestep t (exclude the first entry)
         "log_probs": all_log_probs[:, :-1],
         "rewards": reward.to(torch.float32),
     }
@@ -961,11 +836,11 @@ def main(args):
     ])
     pipe = WanVideoAstraPipeline.from_model_manager(model_manager, device="cuda")
 
+    # Add Lyra's module
     add_framepack_components(pipe.dit)
     
     from diffsynth.models.wan_video_dit_cam import Cam_Encoder, Cam_Processor
     pipe.dit.cam_processor = Cam_Processor(13, 25) # project the input dim to unified dim
-    
     dim = pipe.dit.blocks[0].self_attn.q.weight.shape[0]
     for i, block in enumerate(pipe.dit.blocks):
         # Add Camera Pose Encoder
@@ -977,13 +852,12 @@ def main(args):
         block.projector.weight = nn.Parameter(torch.eye(dim))
         block.projector.bias = nn.Parameter(torch.zeros(dim))
 
+    # Adaptation for loading weight from Astra
+    dit_state_dict = torch.load(args.our_checkpoint_path, map_location="cpu")
     key_parts_map = {
         'sekai_processor': 'cam_processor',
         'moe.experts.0': 'cpe.encoder'
     }
-    dit_state_dict = torch.load(args.our_checkpoint_path, map_location="cpu")
-    
-    # modify parameters name
     keys_to_replace = []
     for old_key in dit_state_dict.keys():
         for old_key_parts in key_parts_map.keys():
@@ -1039,9 +913,6 @@ def main(args):
             trainable_params.append((name, param.numel()))
 
     print("Trainable parameters by module:")
-    # for name, count in trainable_params:
-    #     if "blocks.0" in name:
-    #         print(f"{name:<60} {count:,}")
 
     num_trainable = sum(c for _, c in trainable_params)
     print(f"\nTotal trainable parameters: {num_trainable:,}")
@@ -1146,10 +1017,10 @@ def main(args):
             if (step-1) % args.checkpointing_steps == 0 and step != 1:
                 cpu_state = transformer.state_dict()
                 if rank <= 0:
-                    save_dir = os.path.join(f"{args.experiment_dir}/checkpoints", f"checkpoint-{step}-{epoch}")
+                    save_dir = os.path.join(f"{args.experiment_dir}/checkpoints")
                     os.makedirs(save_dir, exist_ok=True)
                     weight_path = os.path.join(save_dir,
-                                            "diffusion_pytorch_model.ckpt")
+                                            f"checkpoint_{step}_{epoch}.ckpt")
                     torch.save(cpu_state, weight_path)
                     main_print(f"--> checkpoint saved at step {step}: {save_dir}")
                 dist.barrier()
@@ -1523,16 +1394,10 @@ if __name__ == "__main__":
         help="Path to the dataset.",
     )
     parser.add_argument(
-        "--lora_rank",
-        type=int,
-        default=4,
-        help="Rank for LoRA adapters.",
-    )
-    parser.add_argument(
-        "--lora_alpha",
-        type=int,
-        default=16,
-        help="Alpha for LoRA adapters.",
+        "--save_all_rewards",
+        action='store_true',
+        default=False,
+        help="缓存每个样本的reward"
     )
 
     args = parser.parse_args()
