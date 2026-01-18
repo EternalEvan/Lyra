@@ -801,12 +801,14 @@ def main(args):
     initialize_sequence_parallel_state(args.sp_size)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    experiment_dir = f"/mnt/data/louis_crq/DanceGRPO/dancegrpo_experiment_qwj_{timestamp}"
-    os.makedirs(experiment_dir, exist_ok=True)
-    sub_dirs = ["videos", "target_poses", "prompts","checkpoints"]
-    for sub_dir in sub_dirs:
-        os.makedirs(os.path.join(experiment_dir, sub_dir), exist_ok=True)    
-    args.experiment_dir = experiment_dir
+    root_dir = os.path.join(os.path.dirname(__file__), '..')
+    experiment_dir = f"{root_dir}/grpo_experiment_{timestamp}"
+    if rank <= 0:
+        os.makedirs(experiment_dir, exist_ok=True)
+        sub_dirs = ["videos", "target_poses", "checkpoints"]
+        for sub_dir in sub_dirs:
+            os.makedirs(os.path.join(experiment_dir, sub_dir), exist_ok=True)    
+        args.experiment_dir = experiment_dir
 
     # If passed along, set the training seed now. On GPU...
     if args.seed is not None:
@@ -814,20 +816,15 @@ def main(args):
         set_seed(args.seed + rank)
     # We use different seeds for the noise generation in each process to ensure that the noise is different in a batch.
 
-    # Handle the repository creation
-    if rank <= 0 and args.output_dir is not None:
-        os.makedirs(args.output_dir, exist_ok=True)
-
     # For mixed precision training we cast all non-trainable weigths to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required
     preprocess_val = None
     processor = None
     
-    main_print("--> Loading CameraAlignmentReward Model")
+    main_print("🔄 Loading reward model ...")
     reward_model = CameraAlignmentReward(rank=rank, device=device)
 
     replace_dit_model_in_manager()
-    
     model_manager = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
     model_manager.load_models([
         "/mnt/data/louis_crq/models/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors",
@@ -838,7 +835,6 @@ def main(args):
 
     # Add Lyra's module
     add_framepack_components(pipe.dit)
-    
     from diffsynth.models.wan_video_dit_cam import Cam_Encoder, Cam_Processor
     pipe.dit.cam_processor = Cam_Processor(13, 25) # project the input dim to unified dim
     dim = pipe.dit.blocks[0].self_attn.q.weight.shape[0]
@@ -853,7 +849,7 @@ def main(args):
         block.projector.bias = nn.Parameter(torch.zeros(dim))
 
     # Adaptation for loading weight from Astra
-    dit_state_dict = torch.load(args.our_checkpoint_path, map_location="cpu")
+    dit_state_dict = torch.load(args.astra_ckpt_path, map_location="cpu")
     key_parts_map = {
         'sekai_processor': 'cam_processor',
         'moe.experts.0': 'cpe.encoder'
@@ -872,7 +868,8 @@ def main(args):
                 del dit_state_dict[old_key]
                 dit_state_dict[new_key] = value
     
-    pipe.dit.load_state_dict(dit_state_dict, strict=False)  # 使用strict=False以兼容新增的MoE组件
+    main_print("🔄 Loading dit & vae & text_encoder ...")
+    pipe.dit.load_state_dict(dit_state_dict, strict=False)  # 使用strict=False以兼容新增的Cam_Encoder等组件
     
     pipe.dit.requires_grad_(False)
     for name, module in pipe.dit.named_modules():
@@ -881,20 +878,15 @@ def main(args):
                 param.requires_grad = True
     
     pipe = pipe.to(device)
-    model_dtype = next(pipe.dit.parameters()).dtype
-    
     transformer = pipe.dit
-
-    if args.gradient_checkpointing:
-        apply_fsdp_checkpointing(
-            transformer, (DiTBlockWithMoE,), args.selective_checkpointing
-        )
 
     main_print(
         f"--> Initializing FSDP with sharding strategy: {args.fsdp_sharding_startegy}"
     )
-    # Load the reference model
-    main_print(f"--> model loaded")
+    if args.gradient_checkpointing:
+        apply_fsdp_checkpointing(
+            transformer, (DiTBlockWithMoE,), args.selective_checkpointing
+        )
 
     # Set model as trainable.
     transformer.train()
@@ -1081,32 +1073,31 @@ if __name__ == "__main__":
         help="Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process.",
     )
     parser.add_argument(
-        "--train_batch_size",
-        type=int,
-        default=16,
-        help="Batch size (per device) for the training dataloader.",
+        "--dataset_path",
+        type=str,
+        default="/share_zhuyixuan05/zhuyixuan05/spatialvid",
+        help="Path to the dataset.",
     )
     parser.add_argument(
-        "--num_latent_t",
-        type=int,
-        default=1,
-        help="number of latent frames",
+        "--save_all_rewards",
+        action='store_true',
+        default=False,
+        help="缓存每个样本的reward"
     )
+
     # text encoder & vae & diffusion model
-    parser.add_argument("--pretrained_model_name_or_path", type=str)
-    parser.add_argument("--dit_model_name_or_path", type=str, default=None)
-    parser.add_argument("--vae_model_path", type=str, default=None, help="vae model.")
+    parser.add_argument(
+        "--astra_ckpt_path",
+        type=str,
+        default="checkpoints/Astra.ckpt",
+        help="Path to pretrained astra/lyra model checkpoints.",
+    )
     parser.add_argument("--cache_dir", type=str, default="./cache_dir")
 
     # diffusion setting
     parser.add_argument("--ema_decay", type=float, default=0.995)
     parser.add_argument("--ema_start_step", type=int, default=0)
     parser.add_argument("--cfg", type=float, default=0.0)
-    parser.add_argument(
-        "--precondition_outputs",
-        action="store_true",
-        help="Whether to precondition the outputs of the model.",
-    )
 
     # validation & logs
     parser.add_argument(
@@ -1205,7 +1196,13 @@ if __name__ == "__main__":
         action="store_true",
         help="Whether to use CPU offload for param & gradient & optimizer states.",
     )
-
+    
+    parser.add_argument(
+        "--train_batch_size",
+        type=int,
+        default=16,
+        help="Batch size (per device) for the training dataloader.",
+    )
     parser.add_argument("--sp_size", type=int, default=1, help="For sequence parallel")
     parser.add_argument(
         "--train_sp_batch_size",
@@ -1348,18 +1345,6 @@ if __name__ == "__main__":
     
     # Train our model
     parser.add_argument(
-        "--our_checkpoint_path",
-        type=str,
-        default="checkpoints/our_model.ckpt",
-        help="Path to save our model checkpoints.",
-    )
-    parser.add_argument(
-        "--moe_hidden_dim",
-        type=int,
-        default=128,
-        help="Hidden dimension for MoE.",
-    )
-    parser.add_argument(
         "--steps_per_epoch", 
         type=int, 
         default=200000
@@ -1386,18 +1371,6 @@ if __name__ == "__main__":
         type=int, 
         default=32, 
         help="目标帧数"
-    )
-    parser.add_argument(
-        "--dataset_path",
-        type=str,
-        default="/share_zhuyixuan05/zhuyixuan05/spatialvid",
-        help="Path to the dataset.",
-    )
-    parser.add_argument(
-        "--save_all_rewards",
-        action='store_true',
-        default=False,
-        help="缓存每个样本的reward"
     )
 
     args = parser.parse_args()
